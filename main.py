@@ -2,6 +2,8 @@ import os
 import json
 import csv
 import re
+import secrets
+import string
 import asyncio
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -12,7 +14,8 @@ from functools import lru_cache
 import httpx
 import numpy as np
 import faiss
-from fastapi import FastAPI
+import psycopg2
+from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -49,6 +52,36 @@ embedding_dimension = None
 
 # قفل نوشتن لاگ — جلوگیری از race condition هنگام درخواست‌های همزمان
 _log_lock = asyncio.Lock()
+
+
+# ═══════════════════════════════════════════════
+#  اتصال Postgres — FAQ
+# ═══════════════════════════════════════════════
+FAQ_DB_HOST     = os.getenv("FAQ_DB_HOST", "127.0.0.1")
+FAQ_DB_PORT     = os.getenv("FAQ_DB_PORT", "5433")
+FAQ_DB_USER     = os.getenv("FAQ_DB_USER", "chatbot")
+FAQ_DB_PASSWORD = os.getenv("FAQ_DB_PASSWORD", "Xk7#mQ2vN9pL$wR4tZ8j")
+FAQ_DB_NAME     = os.getenv("FAQ_DB_NAME", "chatbot_faq")
+
+# کلید ادمین برای endpointهای مدیریت FAQ — باید به‌صورت env var ست شود، مقدار پیش‌فرض ندارد
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
+
+FAQ_ID_ALPHABET = string.ascii_uppercase + string.digits
+
+
+def get_faq_db_connection():
+    return psycopg2.connect(
+        host=FAQ_DB_HOST,
+        port=FAQ_DB_PORT,
+        user=FAQ_DB_USER,
+        password=FAQ_DB_PASSWORD,
+        dbname=FAQ_DB_NAME,
+    )
+
+
+def verify_admin_key(x_admin_key: str | None = Header(None, alias="X-Admin-Key")):
+    if not ADMIN_API_KEY or x_admin_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # ═══════════════════════════════════════════════
@@ -170,14 +203,54 @@ async def log_chat_interaction(user_msg: str, bot_ans: str, source: str, score: 
 
 
 # ═══════════════════════════════════════════════
-#  بارگذاری Knowledge Base (sync — فقط startup)
+#  بارگذاری Knowledge Base (sync — فقط startup / rebuild)
 # ═══════════════════════════════════════════════
+def load_faq_from_postgres():
+    """FAQ items از جدول Postgres `faq` — جایگزین knowledge/faq.csv."""
+    faq_items = []
+    try:
+        conn = get_faq_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, category, question, answer FROM faq ORDER BY created_at")
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"Error loading FAQ from Postgres: {e}", flush=True)
+        return faq_items
+
+    for row_id, category, question, answer in rows:
+        question = (question or "").strip()
+        answer   = (answer or "").strip()
+        category = (category or "عمومی").strip()
+        if question and answer:
+            faq_items.append({
+                "id": row_id,
+                "category": category,
+                "question": question,
+                "question_norm": normalize_text(question),
+                "answer": answer,
+                "search_text": build_search_text(question, answer, category, "postgres:faq"),
+                "source_file": "postgres:faq",
+                "is_directory": False,
+            })
+
+    return faq_items
+
+
 def load_all_knowledge_bases():
-    knowledge_list = []
+    knowledge_list = load_faq_from_postgres()
+
     if not KNOWLEDGE_DIR.exists():
         return knowledge_list
 
-    csv_files = [f for f in KNOWLEDGE_DIR.glob("*.csv") if f.name != "chat_logs.csv"]
+    # faq.csv دیگر خوانده نمی‌شود — منبع FAQ اکنون جدول Postgres است.
+    # فایل‌های دیگر (مثل companies.csv) دقیقاً مثل قبل خوانده می‌شوند.
+    csv_files = [
+        f for f in KNOWLEDGE_DIR.glob("*.csv")
+        if f.name not in ("chat_logs.csv", "faq.csv")
+    ]
 
     for file_path in csv_files:
         try:
@@ -249,20 +322,16 @@ def load_all_knowledge_bases():
 
 
 # ═══════════════════════════════════════════════
-#  Lifespan — startup / shutdown
+#  Rebuild Knowledge Base + FAISS — startup و بعد از هر تغییر admin
 # ═══════════════════════════════════════════════
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global KNOWLEDGE_BASE, FALLBACK, prompt_config, faiss_index, embedding_dimension, _http
+async def rebuild_knowledge_base():
+    """
+    KNOWLEDGE_BASE را از Postgres (FAQ) + CSVها (مثل companies.csv) دوباره می‌سازد،
+    فقط آیتم‌های جدید/تغییریافته را embed می‌کند (با استفاده از cache موجود)
+    و FAISS index را از نو می‌سازد. global هایی که /chat استفاده می‌کند به‌روز می‌شوند.
+    """
+    global KNOWLEDGE_BASE, faiss_index, embedding_dimension
 
-    # ── ساخت httpx client با connection pool ──
-    _http = httpx.AsyncClient(
-        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-        timeout=httpx.Timeout(60.0),
-    )
-
-    prompt_config = load_prompt_config()
-    FALLBACK      = prompt_config.get("fallback", DEFAULT_FALLBACK)
     KNOWLEDGE_BASE = load_all_knowledge_bases()
     print(f"✅ Knowledge base loaded: {len(KNOWLEDGE_BASE)} items", flush=True)
 
@@ -319,11 +388,33 @@ async def lifespan(app: FastAPI):
         emb_np = np.array(embedding_list).astype("float32")
         embedding_dimension = emb_np.shape[1]
         faiss.normalize_L2(emb_np)
-        faiss_index = faiss.IndexFlatIP(embedding_dimension)
-        faiss_index.add(emb_np)
+        new_index = faiss.IndexFlatIP(embedding_dimension)
+        new_index.add(emb_np)
+        faiss_index = new_index
         print(f"✅ FAISS index built: {faiss_index.ntotal} vectors", flush=True)
     else:
+        faiss_index = None
+        embedding_dimension = None
         print("⚠️  FAISS index empty.", flush=True)
+
+
+# ═══════════════════════════════════════════════
+#  Lifespan — startup / shutdown
+# ═══════════════════════════════════════════════
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global FALLBACK, prompt_config, _http
+
+    # ── ساخت httpx client با connection pool ──
+    _http = httpx.AsyncClient(
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        timeout=httpx.Timeout(60.0),
+    )
+
+    prompt_config = load_prompt_config()
+    FALLBACK      = prompt_config.get("fallback", DEFAULT_FALLBACK)
+
+    await rebuild_knowledge_base()
 
     # ── گرم کردن مدل chat در Ollama (لود در GPU قبل از اولین درخواست) ──
     print("🔥 Warming up Ollama chat model...", flush=True)
@@ -361,6 +452,18 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: list[ChatMessage] = []
+
+
+class FAQCreate(BaseModel):
+    category: str | None = None
+    question: str
+    answer: str
+
+
+class FAQUpdate(BaseModel):
+    category: str | None = None
+    question: str | None = None
+    answer: str | None = None
 
 
 # ═══════════════════════════════════════════════
@@ -833,3 +936,130 @@ async def get_logs(source: str = None, limit: int = 500):
     except Exception as e:
         return {"logs": [], "error": str(e)}
     return {"logs": logs[-limit:]}
+
+
+# ═══════════════════════════════════════════════
+#  Admin CRUD — مدیریت FAQ (Postgres)
+#  همه‌ی endpointها با هدر X-Admin-Key محافظت می‌شوند.
+#  بعد از هر تغییر، embeddings/FAISS بلافاصله و خودکار rebuild می‌شود.
+# ═══════════════════════════════════════════════
+def _faq_row_to_dict(row) -> dict:
+    return {"id": row[0], "category": row[1], "question": row[2], "answer": row[3]}
+
+
+def _generate_faq_id(existing_ids: set) -> str:
+    while True:
+        candidate = "".join(secrets.choice(FAQ_ID_ALPHABET) for _ in range(8))
+        if candidate not in existing_ids:
+            return candidate
+
+
+@app.get("/admin/faq")
+async def admin_list_faq(_: None = Depends(verify_admin_key)):
+    conn = None
+    try:
+        conn = get_faq_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, category, question, answer FROM faq ORDER BY created_at")
+            rows = cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    return [_faq_row_to_dict(r) for r in rows]
+
+
+@app.post("/admin/faq")
+async def admin_create_faq(payload: FAQCreate, _: None = Depends(verify_admin_key)):
+    conn = None
+    try:
+        conn = get_faq_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM faq")
+            existing_ids = {r[0] for r in cur.fetchall()}
+            new_id = _generate_faq_id(existing_ids)
+            cur.execute(
+                """
+                INSERT INTO faq (id, category, question, answer)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, category, question, answer
+                """,
+                (new_id, payload.category, payload.question, payload.answer),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    await rebuild_knowledge_base()
+    return _faq_row_to_dict(row)
+
+
+@app.put("/admin/faq/{faq_id}")
+async def admin_update_faq(faq_id: str, payload: FAQUpdate, _: None = Depends(verify_admin_key)):
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    set_clauses = [f"{field} = %s" for field in updates] + ["updated_at = NOW()"]
+    values = list(updates.values()) + [faq_id]
+
+    conn = None
+    try:
+        conn = get_faq_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE faq SET {', '.join(set_clauses)} WHERE id = %s "
+                f"RETURNING id, category, question, answer",
+                values,
+            )
+            row = cur.fetchone()
+        if row is None:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="FAQ id not found")
+        conn.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    await rebuild_knowledge_base()
+    return _faq_row_to_dict(row)
+
+
+@app.delete("/admin/faq/{faq_id}")
+async def admin_delete_faq(faq_id: str, _: None = Depends(verify_admin_key)):
+    conn = None
+    try:
+        conn = get_faq_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM faq WHERE id = %s", (faq_id,))
+            deleted = cur.rowcount
+        if deleted == 0:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="FAQ id not found")
+        conn.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    await rebuild_knowledge_base()
+    return {"deleted": True}
