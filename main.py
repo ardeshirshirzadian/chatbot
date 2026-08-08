@@ -15,7 +15,8 @@ import httpx
 import numpy as np
 import faiss
 import psycopg2
-from fastapi import FastAPI, Header, HTTPException, Depends
+from psycopg2.extras import Json, RealDictCursor
+from fastapi import FastAPI, Header, HTTPException, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -239,17 +240,104 @@ def load_faq_from_postgres():
     return faq_items
 
 
+def _format_jsonish_field(value) -> str:
+    """نمایش خوانا از یک ستون jsonb (لیست/دیکشنری) — برای phones/emails/logo."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                parts.append(", ".join(str(v) for v in item.values() if v))
+            elif item:
+                parts.append(str(item))
+        return "، ".join(p for p in parts if p)
+    if isinstance(value, dict):
+        return ", ".join(str(v) for v in value.values() if v)
+    return str(value)
+
+
+def load_companies_from_postgres():
+    """آیتم‌های دایرکتوری شرکت‌ها از جدول Postgres `companies` — جایگزین knowledge/companies.csv."""
+    company_items = []
+    try:
+        conn = get_faq_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, brand_name_fa, hall_name, booth_no, website, phones, emails, address_fa
+                    FROM companies
+                    """
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"Error loading companies from Postgres: {e}", flush=True)
+        return company_items
+
+    for row_id, brand_name_fa, hall_name, booth_no, website, phones, emails, address_fa in rows:
+        company_name = (brand_name_fa or "").strip()
+        if not company_name:
+            continue
+        booth_no = (booth_no or "").strip()
+
+        question = (
+            f"اطلاعات غرفه و تماس شرکت {company_name} چیست؟ "
+            f"{company_name} هست؟ غرفه {company_name} کجاست؟ "
+            f"شماره غرفه {company_name} "
+            f"آیا {company_name} در نمایشگاه حضور دارد؟"
+        )
+
+        extra_parts = []
+        if hall_name:
+            extra_parts.append(f"• سالن: {hall_name}")
+        if booth_no:
+            extra_parts.append(f"• شماره غرفه: {booth_no}")
+        if website:
+            extra_parts.append(f"• وبسایت: {website}")
+        phones_str = _format_jsonish_field(phones)
+        if phones_str:
+            extra_parts.append(f"• تلفن: {phones_str}")
+        emails_str = _format_jsonish_field(emails)
+        if emails_str:
+            extra_parts.append(f"• ایمیل: {emails_str}")
+        if address_fa:
+            extra_parts.append(f"• آدرس: {address_fa}")
+
+        answer = json.dumps(
+            {"company": company_name, "booth": booth_no, "extra": "\n".join(extra_parts)},
+            ensure_ascii=False
+        )
+        category = "دایرکتوری شرکت‌ها و غرفه‌ها"
+
+        company_items.append({
+            "id": f"company_{row_id}",
+            "category": category,
+            "question": question,
+            "question_norm": normalize_text(question),
+            "answer": answer,
+            "search_text": build_search_text(question, answer, category, "postgres:companies"),
+            "source_file": "postgres:companies",
+            "is_directory": True,
+        })
+
+    return company_items
+
+
 def load_all_knowledge_bases():
     knowledge_list = load_faq_from_postgres()
+    knowledge_list.extend(load_companies_from_postgres())
 
     if not KNOWLEDGE_DIR.exists():
         return knowledge_list
 
-    # faq.csv دیگر خوانده نمی‌شود — منبع FAQ اکنون جدول Postgres است.
-    # فایل‌های دیگر (مثل companies.csv) دقیقاً مثل قبل خوانده می‌شوند.
+    # faq.csv و companies.csv دیگر خوانده نمی‌شوند — هر دو اکنون از Postgres می‌آیند.
+    # هر فایل CSV دیگری (در صورت وجود) طبق منطق قبلی پردازش می‌شود.
     csv_files = [
         f for f in KNOWLEDGE_DIR.glob("*.csv")
-        if f.name not in ("chat_logs.csv", "faq.csv")
+        if f.name not in ("chat_logs.csv", "faq.csv", "companies.csv")
     ]
 
     for file_path in csv_files:
@@ -1063,3 +1151,89 @@ async def admin_delete_faq(faq_id: str, _: None = Depends(verify_admin_key)):
 
     await rebuild_knowledge_base()
     return {"deleted": True}
+
+
+# ═══════════════════════════════════════════════
+#  Admin Sync — مدیریت شرکت‌ها/غرفه‌داران (Postgres)
+#  آینه‌ای از دیتای شرکت‌ها که پنل ادمین (روی سرور دیگر) push می‌کند.
+#  همان محافظت X-Admin-Key؛ بعد از هر sync، KNOWLEDGE_BASE/FAISS خودکار rebuild می‌شود.
+# ═══════════════════════════════════════════════
+COMPANY_FIELDS = [
+    "id", "brand_name_fa", "brand_name_en", "legal_name_fa", "legal_name_en", "logo",
+    "website", "description_fa", "description_en", "slug", "phones", "emails",
+    "address_fa", "address_en", "industry_id", "hall_name", "booth_no", "is_sponsor",
+    "sponsor_level", "booth_uuid", "booth_xp", "is_manual", "linked_mission_id",
+    "linked_badge_id", "repeatable_scan", "repeatable_scan_hours", "repeatable_start_hour",
+]
+COMPANY_JSON_FIELDS = {"logo", "phones", "emails"}
+COMPANY_BOOLEAN_FIELDS = {"is_sponsor", "is_manual", "repeatable_scan"}  # DEFAULT false در schema
+
+_COMPANY_ALL_COLUMNS = COMPANY_FIELDS + ["event_id"]
+_COMPANY_INSERT_SQL = (
+    f"INSERT INTO companies ({', '.join(_COMPANY_ALL_COLUMNS)}) "
+    f"VALUES ({', '.join(['%s'] * len(_COMPANY_ALL_COLUMNS))}) "
+    f"ON CONFLICT (id) DO UPDATE SET "
+    + ", ".join(f"{col} = EXCLUDED.{col}" for col in COMPANY_FIELDS if col != "id")
+    + ", event_id = EXCLUDED.event_id, synced_at = NOW()"
+)
+
+
+@app.get("/admin/companies")
+async def admin_list_companies(_: None = Depends(verify_admin_key)):
+    conn = None
+    try:
+        conn = get_faq_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM companies ORDER BY brand_name_fa")
+            rows = cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    return [dict(r) for r in rows]
+
+
+@app.post("/admin/companies/sync")
+async def admin_sync_companies(payload: dict = Body(...), _: None = Depends(verify_admin_key)):
+    event_id = payload.get("event_id")
+    companies = payload.get("companies")
+
+    if not isinstance(event_id, int) or isinstance(event_id, bool):
+        raise HTTPException(status_code=400, detail="'event_id' must be an integer")
+    if not isinstance(companies, list):
+        raise HTTPException(status_code=400, detail="'companies' must be a list")
+    for i, c in enumerate(companies):
+        if not isinstance(c, dict) or "id" not in c:
+            raise HTTPException(status_code=400, detail=f"companies[{i}] must be an object with an 'id' field")
+
+    conn = None
+    try:
+        conn = get_faq_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM companies WHERE event_id != %s", (event_id,))
+            for c in companies:
+                values = []
+                for field in COMPANY_FIELDS:
+                    value = c.get(field)
+                    if field in COMPANY_JSON_FIELDS and value is not None:
+                        value = Json(value)
+                    elif field in COMPANY_BOOLEAN_FIELDS and value is None:
+                        value = False
+                    values.append(value)
+                values.append(event_id)
+                cur.execute(_COMPANY_INSERT_SQL, values)
+        conn.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    await rebuild_knowledge_base()
+    return {"synced": len(companies), "event_id": event_id}
