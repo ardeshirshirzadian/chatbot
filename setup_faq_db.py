@@ -3,7 +3,7 @@ import psycopg2
 
 DB_CONFIG = {
     "host": "127.0.0.1",
-    "port": 5433,
+    "port": 5434,
     "user": "chatbot",
     "password": "Xk7#mQ2vN9pL$wR4tZ8j",
     "dbname": "chatbot_faq",
