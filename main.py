@@ -532,6 +532,11 @@ app.add_middleware(
 )
 
 
+@app.get("/health")
+async def health():
+    return {"status": "ok", "knowledge_base_items": len(KNOWLEDGE_BASE) if KNOWLEDGE_BASE is not None else 0}
+
+
 class ChatMessage(BaseModel):
     role: str
     content: str
