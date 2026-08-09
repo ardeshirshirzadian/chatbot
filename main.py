@@ -655,6 +655,7 @@ class FAQCreate(BaseModel):
     answer: str
     question_en: str | None = None
     answer_en: str | None = None
+    synced_to_primary: bool = True
 
 
 class FAQUpdate(BaseModel):
@@ -663,6 +664,7 @@ class FAQUpdate(BaseModel):
     answer: str | None = None
     question_en: str | None = None
     answer_en: str | None = None
+    synced_to_primary: bool | None = None
 
 
 # ═══════════════════════════════════════════════
@@ -1214,6 +1216,7 @@ def _faq_row_to_dict(row) -> dict:
         "id": row[0], "category": row[1], "question": row[2], "answer": row[3],
         "question_en": row[4] if len(row) > 4 else None,
         "answer_en": row[5] if len(row) > 5 else None,
+        "synced_to_primary": row[6] if len(row) > 6 else None,
     }
 
 
@@ -1231,7 +1234,7 @@ async def admin_list_faq(_: None = Depends(verify_admin_key)):
         conn = get_faq_db_connection()
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, category, question, answer, question_en, answer_en "
+                "SELECT id, category, question, answer, question_en, answer_en, synced_to_primary "
                 "FROM faq ORDER BY created_at"
             )
             rows = cur.fetchall()
@@ -1258,12 +1261,12 @@ async def admin_create_faq(payload: FAQCreate, _: None = Depends(verify_admin_ke
                 new_id = _generate_faq_id(existing_ids)
             cur.execute(
                 """
-                INSERT INTO faq (id, category, question, answer, question_en, answer_en)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                RETURNING id, category, question, answer, question_en, answer_en
+                INSERT INTO faq (id, category, question, answer, question_en, answer_en, synced_to_primary)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id, category, question, answer, question_en, answer_en, synced_to_primary
                 """,
                 (new_id, payload.category, payload.question, payload.answer,
-                 payload.question_en, payload.answer_en),
+                 payload.question_en, payload.answer_en, payload.synced_to_primary),
             )
             row = cur.fetchone()
         conn.commit()
@@ -1294,7 +1297,7 @@ async def admin_update_faq(faq_id: str, payload: FAQUpdate, _: None = Depends(ve
         with conn.cursor() as cur:
             cur.execute(
                 f"UPDATE faq SET {', '.join(set_clauses)} WHERE id = %s "
-                f"RETURNING id, category, question, answer, question_en, answer_en",
+                f"RETURNING id, category, question, answer, question_en, answer_en, synced_to_primary",
                 values,
             )
             row = cur.fetchone()
