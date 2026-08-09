@@ -52,6 +52,13 @@ prompt_config   = {}
 faiss_index     = None
 embedding_dimension = None
 
+# ── English-mode FAISS index (فقط آیتم‌هایی که ترجمه انگلیسی دارند) ──
+# faiss_index_en روی زیرمجموعه‌ای از KNOWLEDGE_BASE ساخته می‌شود؛ KB_EN_INDICES[i]
+# اندیس واقعی آیتم در KNOWLEDGE_BASE را برای نتیجه i-ام جستجوی FAISS انگلیسی برمی‌گرداند.
+faiss_index_en       = None
+embedding_dimension_en = None
+KB_EN_INDICES        = []
+
 # قفل نوشتن لاگ — جلوگیری از race condition هنگام درخواست‌های همزمان
 _log_lock = asyncio.Lock()
 
@@ -214,7 +221,10 @@ def load_faq_from_postgres():
         conn = get_faq_db_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id, category, question, answer FROM faq ORDER BY created_at")
+                cur.execute(
+                    "SELECT id, category, question, answer, question_en, answer_en "
+                    "FROM faq ORDER BY created_at"
+                )
                 rows = cur.fetchall()
         finally:
             conn.close()
@@ -222,12 +232,14 @@ def load_faq_from_postgres():
         print(f"Error loading FAQ from Postgres: {e}", flush=True)
         return faq_items
 
-    for row_id, category, question, answer in rows:
+    for row_id, category, question, answer, question_en, answer_en in rows:
         question = (question or "").strip()
         answer   = (answer or "").strip()
         category = (category or "عمومی").strip()
+        question_en = (question_en or "").strip()
+        answer_en   = (answer_en or "").strip()
         if question and answer:
-            faq_items.append({
+            item = {
                 "id": row_id,
                 "category": category,
                 "question": question,
@@ -236,7 +248,17 @@ def load_faq_from_postgres():
                 "search_text": build_search_text(question, answer, category, "postgres:faq"),
                 "source_file": "postgres:faq",
                 "is_directory": False,
-            })
+                # ── فیلدهای انگلیسی (اختیاری) — فقط وقتی هر دو question_en/answer_en
+                #    پر باشند این آیتم در جستجوی lang=en قابل تطبیق می‌شود ──
+                "question_en": question_en,
+                "answer_en": answer_en,
+                "question_en_norm": normalize_text(question_en) if (question_en and answer_en) else "",
+                "search_text_en": (
+                    build_search_text(question_en, answer_en, category, "postgres:faq")
+                    if (question_en and answer_en) else ""
+                ),
+            }
+            faq_items.append(item)
 
     return faq_items
 
@@ -267,7 +289,8 @@ def load_companies_from_postgres():
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id, brand_name_fa, hall_name, booth_no, website, phones, emails, address_fa
+                    SELECT id, brand_name_fa, brand_name_en, hall_name, booth_no, website,
+                           phones, emails, address_fa, address_en, description_en
                     FROM companies
                     """
                 )
@@ -278,7 +301,8 @@ def load_companies_from_postgres():
         print(f"Error loading companies from Postgres: {e}", flush=True)
         return company_items
 
-    for row_id, brand_name_fa, hall_name, booth_no, website, phones, emails, address_fa in rows:
+    for (row_id, brand_name_fa, brand_name_en, hall_name, booth_no, website,
+         phones, emails, address_fa, address_en, description_en) in rows:
         company_name = (brand_name_fa or "").strip()
         if not company_name:
             continue
@@ -313,7 +337,7 @@ def load_companies_from_postgres():
         )
         category = "دایرکتوری شرکت‌ها و غرفه‌ها"
 
-        company_items.append({
+        item = {
             "id": f"company_{row_id}",
             "category": category,
             "question": question,
@@ -322,7 +346,54 @@ def load_companies_from_postgres():
             "search_text": build_search_text(question, answer, category, "postgres:companies"),
             "source_file": "postgres:companies",
             "is_directory": True,
-        })
+        }
+
+        # ── نمایندگی انگلیسی (اختیاری) — فقط اگر brand_name_en موجود باشد.
+        #    فیلدهای فارسیِ متنی (مثل description_fa) هرگز اینجا استفاده نمی‌شوند؛
+        #    فیلدهای خنثی از نظر زبان (website/phones/hall_name/booth_no) در هر دو حالت قابل استفاده‌اند. ──
+        company_name_en = (brand_name_en or "").strip()
+        if company_name_en:
+            question_en = (
+                f"What are the booth and contact details of {company_name_en}? "
+                f"Is {company_name_en} present at the exhibition? "
+                f"Where is the {company_name_en} booth? "
+                f"Booth number for {company_name_en}"
+            )
+
+            extra_parts_en = []
+            if hall_name:
+                extra_parts_en.append(f"• Hall: {hall_name}")
+            if booth_no:
+                extra_parts_en.append(f"• Booth No: {booth_no}")
+            if website:
+                extra_parts_en.append(f"• Website: {website}")
+            if phones_str:
+                extra_parts_en.append(f"• Phone: {phones_str}")
+            if emails_str:
+                extra_parts_en.append(f"• Email: {emails_str}")
+            address_en_clean = (address_en or "").strip()
+            if address_en_clean:
+                extra_parts_en.append(f"• Address: {address_en_clean}")
+            description_en_clean = (description_en or "").strip()
+            if description_en_clean:
+                extra_parts_en.append(f"• About: {description_en_clean}")
+
+            answer_en = json.dumps(
+                {"company": company_name_en, "booth": booth_no, "extra": "\n".join(extra_parts_en)},
+                ensure_ascii=False
+            )
+
+            item["question_en"] = question_en
+            item["question_en_norm"] = normalize_text(question_en)
+            item["answer_en"] = answer_en
+            item["search_text_en"] = build_search_text(question_en, answer_en, category, "postgres:companies")
+        else:
+            item["question_en"] = ""
+            item["question_en_norm"] = ""
+            item["answer_en"] = ""
+            item["search_text_en"] = ""
+
+        company_items.append(item)
 
     return company_items
 
@@ -420,6 +491,7 @@ async def rebuild_knowledge_base():
     و FAISS index را از نو می‌سازد. global هایی که /chat استفاده می‌کند به‌روز می‌شوند.
     """
     global KNOWLEDGE_BASE, faiss_index, embedding_dimension
+    global faiss_index_en, embedding_dimension_en, KB_EN_INDICES
 
     KNOWLEDGE_BASE = load_all_knowledge_bases()
     print(f"✅ Knowledge base loaded: {len(KNOWLEDGE_BASE)} items", flush=True)
@@ -436,11 +508,15 @@ async def rebuild_knowledge_base():
     # ── embedding موازی برای آیتم‌های جدید ──
     # آیتم‌هایی که cache ندارند همزمان embed می‌شوند (asyncio.gather)
     # ترتیب KNOWLEDGE_BASE حفظ می‌شود
-    keys_to_embed = [
-        (i, item["question_norm"])
-        for i, item in enumerate(KNOWLEDGE_BASE)
-        if item["question_norm"] not in cached_embeddings
-    ]
+    # فیلد question_en_norm (در صورت وجود ترجمه) هم به همین لیست اضافه می‌شود
+    # تا embedding مخصوص جستجوی lang=en هم ساخته شود.
+    keys_to_embed = []
+    for i, item in enumerate(KNOWLEDGE_BASE):
+        if item["question_norm"] not in cached_embeddings:
+            keys_to_embed.append((i, item["question_norm"]))
+        en_norm = item.get("question_en_norm")
+        if en_norm and en_norm not in cached_embeddings:
+            keys_to_embed.append((i, en_norm))
 
     if keys_to_embed:
         print(f"🔄 Embedding {len(keys_to_embed)} new items (parallel)...", flush=True)
@@ -485,6 +561,29 @@ async def rebuild_knowledge_base():
         faiss_index = None
         embedding_dimension = None
         print("⚠️  FAISS index empty.", flush=True)
+
+    # ── ساخت FAISS index انگلیسی — فقط روی آیتم‌هایی که ترجمه دارند ──
+    # KB_EN_INDICES[i] اندیس واقعی در KNOWLEDGE_BASE برای نتیجه i-ام این index است.
+    embedding_list_en = []
+    KB_EN_INDICES = []
+    for i, item in enumerate(KNOWLEDGE_BASE):
+        en_norm = item.get("question_en_norm")
+        if en_norm and en_norm in cached_embeddings:
+            embedding_list_en.append(cached_embeddings[en_norm])
+            KB_EN_INDICES.append(i)
+
+    if embedding_list_en:
+        emb_np_en = np.array(embedding_list_en).astype("float32")
+        embedding_dimension_en = emb_np_en.shape[1]
+        faiss.normalize_L2(emb_np_en)
+        new_index_en = faiss.IndexFlatIP(embedding_dimension_en)
+        new_index_en.add(emb_np_en)
+        faiss_index_en = new_index_en
+        print(f"✅ FAISS EN index built: {faiss_index_en.ntotal} vectors", flush=True)
+    else:
+        faiss_index_en = None
+        embedding_dimension_en = None
+        print("⚠️  FAISS EN index empty (no English translations yet).", flush=True)
 
 
 # ═══════════════════════════════════════════════
@@ -533,6 +632,11 @@ app.add_middleware(
 )
 
 
+@app.get("/health")
+async def health():
+    return {"status": "ok", "knowledge_base_items": len(KNOWLEDGE_BASE) if KNOWLEDGE_BASE is not None else 0}
+
+
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -541,6 +645,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: list[ChatMessage] = []
+    lang: str = "fa"
 
 
 class FAQCreate(BaseModel):
@@ -548,12 +653,16 @@ class FAQCreate(BaseModel):
     category: str | None = None
     question: str
     answer: str
+    question_en: str | None = None
+    answer_en: str | None = None
 
 
 class FAQUpdate(BaseModel):
     category: str | None = None
     question: str | None = None
     answer: str | None = None
+    question_en: str | None = None
+    answer_en: str | None = None
 
 
 # ═══════════════════════════════════════════════
@@ -811,13 +920,41 @@ def search_examples(user_message: str):
     return None, best_score
 
 
-def search_exact_knowledge(user_message: str):
+def _lang_fields(item: dict, lang: str):
+    """
+    (question_norm, question, search_text) را برای زبان داده‌شده برمی‌گرداند.
+    برای lang="en"، اگر آیتم ترجمه انگلیسی نداشته باشد (question_en_norm یا
+    search_text_en خالی) None برمی‌گرداند — یعنی این آیتم در جستجوی انگلیسی
+    اصلاً دیده نمی‌شود (به‌جای fallback نادرست به متن فارسی).
+    برای lang="fa" (پیش‌فرض) دقیقاً همان فیلدهای قبلی را برمی‌گرداند — رفتار فعلی
+    بدون تغییر.
+    """
+    if lang == "en":
+        q_norm = item.get("question_en_norm")
+        search_text_en = item.get("search_text_en")
+        if not q_norm or not search_text_en:
+            return None
+        return q_norm, item.get("question_en", ""), search_text_en
+    return item["question_norm"], item["question"], item["search_text"]
+
+
+def _answer_for_lang(item: dict, lang: str) -> str:
+    if lang == "en":
+        return item.get("answer_en") or ""
+    return item["answer"]
+
+
+def search_exact_knowledge(user_message: str, lang: str = "fa"):
     user_norm = normalize_text(user_message)
     best, best_score = None, 0.0
     for item in KNOWLEDGE_BASE:
-        if user_norm == item["question_norm"]:
+        fields = _lang_fields(item, lang)
+        if fields is None:
+            continue
+        q_norm, _, _ = fields
+        if user_norm == q_norm:
             return item, 1.0
-        score = similarity(user_norm, item["question_norm"])
+        score = similarity(user_norm, q_norm)
         if score > best_score:
             best_score = score
             best = item
@@ -826,37 +963,54 @@ def search_exact_knowledge(user_message: str):
     return None, best_score
 
 
-async def search_hybrid_knowledge(user_message: str, top_k: int = 10) -> list:
+async def search_hybrid_knowledge(user_message: str, top_k: int = 10, lang: str = "fa") -> list:
     """
     FAISS + keyword + fuzzy.
     embed_text_async یک‌بار await می‌شود — بقیه CPU-bound.
     ترتیب: اول embed (I/O)، بعد FAISS search (CPU).
+    lang="en": از faiss_index_en (فقط آیتم‌های دارای ترجمه) و فیلدهای انگلیسی
+    استفاده می‌شود؛ آیتم‌های بدون ترجمه اصلاً وارد نتایج نمی‌شوند.
     """
-    if faiss_index is None or faiss_index.ntotal == 0:
-        scored = [
-            {"knowledge": item,
-             "score": keyword_score(user_message, item["search_text"]) * 0.70
-                    + similarity(user_message, item["question"]) * 0.30}
-            for item in KNOWLEDGE_BASE
-        ]
+    index = faiss_index_en if lang == "en" else faiss_index
+    en_indices = KB_EN_INDICES if lang == "en" else None
+
+    if index is None or index.ntotal == 0:
+        scored = []
+        for item in KNOWLEDGE_BASE:
+            fields = _lang_fields(item, lang)
+            if fields is None:
+                continue
+            _, question, search_text = fields
+            scored.append({
+                "knowledge": item,
+                "score": keyword_score(user_message, search_text) * 0.70
+                       + similarity(user_message, question) * 0.30
+            })
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:top_k]
 
     # ── async embed — این تنها I/O این تابع است ──
     query_vec = np.array([await embed_text_async(user_message)]).astype("float32")
     faiss.normalize_L2(query_vec)
-    k = min(top_k, faiss_index.ntotal)
-    D, I = faiss_index.search(query_vec, k)
+    k = min(top_k, index.ntotal)
+    D, I = index.search(query_vec, k)
 
     scored = []
     for idx, emb_score in zip(I[0], D[0]):
-        if idx == -1 or idx >= len(KNOWLEDGE_BASE):
+        if idx == -1:
             continue
-        item = KNOWLEDGE_BASE[idx]
+        kb_idx = en_indices[idx] if en_indices is not None else idx
+        if kb_idx >= len(KNOWLEDGE_BASE):
+            continue
+        item = KNOWLEDGE_BASE[kb_idx]
+        fields = _lang_fields(item, lang)
+        if fields is None:
+            continue
+        _, question, search_text = fields
         score = (
             float(emb_score) * 0.50
-            + keyword_score(user_message, item["search_text"]) * 0.35
-            + similarity(user_message, item["question"]) * 0.15
+            + keyword_score(user_message, search_text) * 0.35
+            + similarity(user_message, question) * 0.15
         )
         scored.append({"knowledge": item, "score": score})
 
@@ -864,10 +1018,25 @@ async def search_hybrid_knowledge(user_message: str, top_k: int = 10) -> list:
     return scored
 
 
-def format_directory_response(user_message: str, raw_answer_json: str) -> str:
+def format_directory_response(user_message: str, raw_answer_json: str, lang: str = "fa") -> str:
     try:
         data     = json.loads(raw_answer_json)
         user_norm = normalize_text(user_message)
+
+        if lang == "en":
+            wants_booth_only = (
+                any(w in user_norm for w in ["booth", "stand", "hall"])
+                and not any(w in user_norm for w in ["address", "phone", "contact", "where", "email"])
+            )
+            parts = [f"🏢 Company: {data['company']}"]
+            if data.get("booth"):
+                parts.append(f"📍 Booth No: {data['booth']}")
+            if wants_booth_only:
+                return "\n".join(parts)
+            if data.get("extra"):
+                return "\n".join(parts) + "\n\nℹ️ Additional info:\n" + data["extra"]
+            return "\n".join(parts)
+
         wants_booth_only = (
             any(w in user_norm for w in ["غرفه","کدوم سالن","شماره غرفه","کدومه"])
             and not any(w in user_norm for w in ["آدرس","تلفن","شماره تماس","کجاست"])
@@ -884,7 +1053,7 @@ def format_directory_response(user_message: str, raw_answer_json: str) -> str:
         return raw_answer_json
 
 
-async def select_best_candidate(user_message: str, candidates: list) -> dict | None:
+async def select_best_candidate(user_message: str, candidates: list, lang: str = "fa") -> dict | None:
     """
     Ollama فقط یک عدد برمی‌گرداند.
     async — در حین انتظار Ollama، event loop برای بقیه requestها آزاد است.
@@ -892,7 +1061,12 @@ async def select_best_candidate(user_message: str, candidates: list) -> dict | N
     if not candidates:
         return None
 
-    options = "".join(f"{i}. {c['knowledge']['question']}\n" for i, c in enumerate(candidates, 1))
+    def _cand_question(c):
+        if lang == "en":
+            return c["knowledge"].get("question_en") or c["knowledge"]["question"]
+        return c["knowledge"]["question"]
+
+    options = "".join(f"{i}. {_cand_question(c)}\n" for i, c in enumerate(candidates, 1))
 
     system_prompt = (
         "You are a strict relevance judge for a pharmaceutical exhibition chatbot. "
@@ -963,16 +1137,17 @@ async def chat(req: ChatRequest):
         return {"answer": example_answer, "source": "example"}
 
     # ۳. Exact / fuzzy search (sync — CPU)
-    exact_item, exact_score = search_exact_knowledge(search_query)
+    exact_item, exact_score = search_exact_knowledge(search_query, lang=req.lang)
     if exact_item:
-        ans = exact_item["answer"]
+        ans = _answer_for_lang(exact_item, req.lang)
         if exact_item.get("is_directory"):
-            ans = format_directory_response(user_message, ans)
-        await log_chat_interaction(user_message, ans, "exact", exact_score, exact_item["question"])
+            ans = format_directory_response(user_message, ans, lang=req.lang)
+        matched_q = exact_item.get("question_en") if req.lang == "en" else exact_item["question"]
+        await log_chat_interaction(user_message, ans, "exact", exact_score, matched_q)
         return {"answer": ans, "source": "exact"}
 
     # ۴. FAISS + hybrid (async — شامل embed I/O)
-    candidates = await search_hybrid_knowledge(search_query, top_k=10)
+    candidates = await search_hybrid_knowledge(search_query, top_k=10, lang=req.lang)
     if not candidates:
         await log_chat_interaction(user_message, FALLBACK, "fallback", 0.0)
         return {"answer": FALLBACK, "source": "fallback"}
@@ -987,17 +1162,18 @@ async def chat(req: ChatRequest):
         return {"answer": FALLBACK, "source": "fallback"}
 
     # ۶. Ollama انتخاب (async — I/O)
-    selected = await select_best_candidate(search_query, candidates[:5])
+    selected = await select_best_candidate(search_query, candidates[:5], lang=req.lang)
     if not selected:
         await log_chat_interaction(user_message, FALLBACK, "fallback", 0.0)
         return {"answer": FALLBACK, "source": "fallback"}
 
     # ۷. فرمت و برگشت
-    ans = selected["knowledge"]["answer"]
+    ans = _answer_for_lang(selected["knowledge"], req.lang)
     if selected["knowledge"].get("is_directory"):
-        ans = format_directory_response(user_message, ans)
+        ans = format_directory_response(user_message, ans, lang=req.lang)
 
-    await log_chat_interaction(user_message, ans, "rag", selected["score"], selected["knowledge"]["question"])
+    matched_q = selected["knowledge"].get("question_en") if req.lang == "en" else selected["knowledge"]["question"]
+    await log_chat_interaction(user_message, ans, "rag", selected["score"], matched_q)
     return {"answer": ans, "source": "rag"}
 
 
@@ -1034,7 +1210,11 @@ async def get_logs(source: str = None, limit: int = 500):
 #  بعد از هر تغییر، embeddings/FAISS بلافاصله و خودکار rebuild می‌شود.
 # ═══════════════════════════════════════════════
 def _faq_row_to_dict(row) -> dict:
-    return {"id": row[0], "category": row[1], "question": row[2], "answer": row[3]}
+    return {
+        "id": row[0], "category": row[1], "question": row[2], "answer": row[3],
+        "question_en": row[4] if len(row) > 4 else None,
+        "answer_en": row[5] if len(row) > 5 else None,
+    }
 
 
 def _generate_faq_id(existing_ids: set) -> str:
@@ -1050,7 +1230,10 @@ async def admin_list_faq(_: None = Depends(verify_admin_key)):
     try:
         conn = get_faq_db_connection()
         with conn.cursor() as cur:
-            cur.execute("SELECT id, category, question, answer FROM faq ORDER BY created_at")
+            cur.execute(
+                "SELECT id, category, question, answer, question_en, answer_en "
+                "FROM faq ORDER BY created_at"
+            )
             rows = cur.fetchall()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
@@ -1075,11 +1258,12 @@ async def admin_create_faq(payload: FAQCreate, _: None = Depends(verify_admin_ke
                 new_id = _generate_faq_id(existing_ids)
             cur.execute(
                 """
-                INSERT INTO faq (id, category, question, answer)
-                VALUES (%s, %s, %s, %s)
-                RETURNING id, category, question, answer
+                INSERT INTO faq (id, category, question, answer, question_en, answer_en)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id, category, question, answer, question_en, answer_en
                 """,
-                (new_id, payload.category, payload.question, payload.answer),
+                (new_id, payload.category, payload.question, payload.answer,
+                 payload.question_en, payload.answer_en),
             )
             row = cur.fetchone()
         conn.commit()
@@ -1110,7 +1294,7 @@ async def admin_update_faq(faq_id: str, payload: FAQUpdate, _: None = Depends(ve
         with conn.cursor() as cur:
             cur.execute(
                 f"UPDATE faq SET {', '.join(set_clauses)} WHERE id = %s "
-                f"RETURNING id, category, question, answer",
+                f"RETURNING id, category, question, answer, question_en, answer_en",
                 values,
             )
             row = cur.fetchone()
