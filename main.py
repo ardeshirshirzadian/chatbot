@@ -543,6 +543,7 @@ class ChatRequest(BaseModel):
 
 
 class FAQCreate(BaseModel):
+    id: str | None = None
     category: str | None = None
     question: str
     answer: str
@@ -1067,7 +1068,10 @@ async def admin_create_faq(payload: FAQCreate, _: None = Depends(verify_admin_ke
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM faq")
             existing_ids = {r[0] for r in cur.fetchall()}
-            new_id = _generate_faq_id(existing_ids)
+            if payload.id is not None and payload.id.strip():
+                new_id = payload.id
+            else:
+                new_id = _generate_faq_id(existing_ids)
             cur.execute(
                 """
                 INSERT INTO faq (id, category, question, answer)
