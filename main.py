@@ -5,6 +5,9 @@ import re
 import secrets
 import string
 import asyncio
+import logging
+import time
+from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -36,11 +39,57 @@ OLLAMA_EMBED_URL = f"{OLLAMA_BASE_URL}/api/embeddings"
 MODEL       = "iranpharma-assistant"
 EMBED_MODEL = "bge-m3"
 
+# ── لاگ ساختاریافته (timestamp + level) — برای دیدن خطاهای Ollama که قبلاً بی‌صدا فرو می‌افتادند ──
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("iranpharma_chat")
+
+# هر چند دقیقه یک‌بار مدل چت را با یک درخواست حداقلی بیدار نگه می‌دارد —
+# شبکه ایمنی مستقل از OLLAMA_KEEP_ALIVE، برای مواقعی که کانتینر Ollama
+# مستقل از این سرویس ری‌استارت شود و مدل از حافظه GPU خارج شود.
+OLLAMA_REWARM_INTERVAL_SECONDS = 240
+
+# ── صف پردازش با ظرفیت محدود — جایگزین رد سخت --limit-concurrency ──
+# به‌جای رد فوری درخواست ۶۱ام، اگر همه‌ی PROCESSING_SLOTS اشغال باشند، درخواست
+# در صف (تا سقف MAX_QUEUE_DEPTH) منتظر می‌ماند تا یک پردازش پیدا کند، به‌جای رد فوری.
+#
+# مقادیر بر اساس تست بار امروز: تا ۱۰۰ درخواست همزمان صفر خطای واقعی، فقط
+# افزایش latency (میانگین ۸ تا ۱۶ ثانیه). بنابراین:
+#   - PROCESSING_SLOTS=60 همان سقف قبلی را حفظ می‌کند (منطقه‌ی شناخته‌شده و امن از نظر latency).
+#   - MAX_QUEUE_DEPTH=40 یعنی PROCESSING_SLOTS + MAX_QUEUE_DEPTH = 100 — دقیقاً همان
+#     سقفی که در تست بار واقعاً معتبرسنجی شد، نه فراتر از آن.
+#   - MAX_WAIT_SECONDS=30 (نه ۱۸ پیشنهادی اولیه): یک job صف‌شده ممکن است تا ~16s برای
+#     آزاد شدن یک slot صبر کند و سپس خودش تا ~16s پردازش شود (~32s بدترین حالت واقع‌گرایانه).
+#     18s قبل از تمام‌شدن اکثر jobهای صف‌شده، "busy" کاذب برمی‌گرداند؛ 30s این حاشیه را پوشش می‌دهد.
+PROCESSING_SLOTS = 60
+MAX_QUEUE_DEPTH = 40
+MAX_WAIT_SECONDS = 30
+QUEUE_RESULT_TTL_SECONDS = 120  # مدت نگهداری نتیجه‌ی تکمیل‌شده در حافظه قبل از پاک‌سازی
+AVG_PIPELINE_SECONDS = 12       # میانگین تقریبی مشاهده‌شده (۸ تا ۱۶ ثانیه) — فقط برای تخمین زمان انتظار
+
+BUSY_MESSAGE_FA = "الان شلوغه، لطفاً بعداً امتحان کنید."
+
 DEFAULT_FALLBACK = "این سؤال خارج از حوزه نمایشگاه ایران‌فارما است یا اطلاعات آن در پایگاه دانش ثبت نشده است."
 
 # ── یک httpx.AsyncClient مشترک برای کل اپ ──────────────────────────
 # keep-alive + connection pool — در روزهای نمایشگاه فشار کمتری روی Ollama
 _http: httpx.AsyncClient = None
+_rewarm_task: asyncio.Task = None
+
+# ── صف /chat و worker pool — ساخته می‌شوند در lifespan startup ──
+_job_queue: asyncio.Queue = None
+_slot_semaphore: asyncio.Semaphore = None
+_queue_worker_tasks: list = []
+_queue_results: dict = {}   # queue_id → {"state": "queued"|"done", ...}
+_next_seq = 0                # شماره‌ی افزایشی هر job که وارد صف می‌شود
+_dequeued_count = 0          # تعداد jobهایی که تا الان از صف خارج شده‌اند (برای محاسبه‌ی position)
+
+
+@dataclass
+class _QueueJob:
+    queue_id: str
+    req: "ChatRequest"
+    seq: int
+    enqueued_at: float
 
 # ═══════════════════════════════════════════════
 #  حالت‌های Global
@@ -143,11 +192,12 @@ async def embed_text_async(text: str) -> list:
     return resp.json()["embedding"]
 
 
-async def call_ollama_async(messages: list, num_predict: int = 3, temperature: float = 0) -> str | None:
+async def call_ollama_async(messages: list, num_predict: int = 3, temperature: float = 0, context: str = "") -> str | None:
     """
     یک فراخوانی async به Ollama chat API.
     stream=False — فقط یک عدد برمی‌گرداند (انتخاب کاندیدا).
     timeout=30s — اگر مدل کند بود graceful timeout.
+    context: برچسب محل فراخوانی (مثلاً "select_candidate"، "warmup") — برای تشخیص‌پذیری در لاگ خطا.
     """
     try:
         resp = await _http.post(
@@ -163,26 +213,45 @@ async def call_ollama_async(messages: list, num_predict: int = 3, temperature: f
         resp.raise_for_status()
         return resp.json()["message"]["content"].strip()
     except httpx.TimeoutException:
-        print("⏱️  Ollama timeout", flush=True)
+        logger.warning(f"Ollama timeout (context={context or 'unknown'})")
     except Exception as e:
-        print(f"⚠️  Ollama error: {e}", flush=True)
+        logger.warning(f"Ollama error (context={context or 'unknown'}): {type(e).__name__}: {e}")
     return None
 
 
 async def warmup_ollama_model():
     """
-    یک درخواست حداقلی به مدل chat می‌فرستد تا در startup در حافظه GPU لود شود،
-    به‌جای اینکه اولین کاربر واقعی منتظر cold start بماند.
+    یک درخواست حداقلی به مدل chat می‌فرستد تا در حافظه GPU لود شود —
+    هم در startup (به‌جای اینکه اولین کاربر واقعی منتظر cold start بماند)
+    و هم به‌صورت دوره‌ای از periodic_ollama_rewarm.
     """
     try:
         return await call_ollama_async(
             messages=[{"role": "user", "content": "hi"}],
             num_predict=1,
             temperature=0,
+            context="warmup",
         )
     except Exception as e:
-        print(f"⚠️  Ollama warmup failed: {e}", flush=True)
+        logger.warning(f"Ollama warmup failed: {type(e).__name__}: {e}")
         return None
+
+
+async def periodic_ollama_rewarm():
+    """
+    شبکه ایمنی مستقل از OLLAMA_KEEP_ALIVE: هر چند دقیقه یک‌بار مدل چت را
+    با یک درخواست حداقلی (num_predict=1) بیدار نگه می‌دارد. اگر کانتینر
+    Ollama مستقل از این سرویس ری‌استارت شده و مدل از GPU خارج شده باشد،
+    این تسک ظرف چند دقیقه دوباره لودش می‌کند — نه یک کاربر واقعی.
+    """
+    while True:
+        await asyncio.sleep(OLLAMA_REWARM_INTERVAL_SECONDS)
+        try:
+            result = await warmup_ollama_model()
+            if result is None:
+                logger.warning("Periodic Ollama re-warm ping got no response")
+        except Exception as e:
+            logger.warning(f"Periodic Ollama re-warm ping failed: {type(e).__name__}: {e}")
 
 
 # ═══════════════════════════════════════════════
@@ -577,7 +646,8 @@ async def rebuild_knowledge_base():
 # ═══════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global FALLBACK, prompt_config, _http
+    global FALLBACK, prompt_config, _http, _rewarm_task
+    global _job_queue, _slot_semaphore, _queue_worker_tasks
 
     # ── ساخت httpx client با connection pool ──
     _http = httpx.AsyncClient(
@@ -598,9 +668,30 @@ async def lifespan(app: FastAPI):
     else:
         print("⚠️  Ollama chat model warmup failed (Ollama may be slow or unavailable)", flush=True)
 
+    # ── شبکه ایمنی re-warm دوره‌ای — مستقل از OLLAMA_KEEP_ALIVE ──
+    _rewarm_task = asyncio.create_task(periodic_ollama_rewarm())
+
+    # ── صف /chat + worker pool — همان الگوی lifecycle که _rewarm_task استفاده می‌کند ──
+    _job_queue = asyncio.Queue()
+    _slot_semaphore = asyncio.Semaphore(PROCESSING_SLOTS)
+    _queue_worker_tasks = [
+        asyncio.create_task(chat_queue_worker(i)) for i in range(PROCESSING_SLOTS)
+    ]
+    print(f"✅ Chat queue workers started: {PROCESSING_SLOTS}", flush=True)
+
     yield
 
     # ── shutdown ──
+    _rewarm_task.cancel()
+    try:
+        await _rewarm_task
+    except asyncio.CancelledError:
+        pass
+
+    for t in _queue_worker_tasks:
+        t.cancel()
+    await asyncio.gather(*_queue_worker_tasks, return_exceptions=True)
+
     await _http.aclose()
     print("✅ HTTP client closed.", flush=True)
 
@@ -965,7 +1056,7 @@ async def search_hybrid_knowledge(user_message: str, top_k: int = 10, lang: str 
     active_index = faiss_index_en if lang == "en" else faiss_index
     index_to_kb  = en_index_to_kb if lang == "en" else None
 
-    if active_index is None or active_index.ntotal == 0:
+    def _keyword_only_fallback():
         scored = []
         for item in KNOWLEDGE_BASE:
             search_text = _lang_search_text(item, lang)
@@ -980,8 +1071,18 @@ async def search_hybrid_knowledge(user_message: str, top_k: int = 10, lang: str 
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:top_k]
 
+    if active_index is None or active_index.ntotal == 0:
+        return _keyword_only_fallback()
+
     # ── async embed — این تنها I/O این تابع است ──
-    query_vec = np.array([await embed_text_async(user_message)]).astype("float32")
+    # اگر Ollama در دسترس نباشد، به‌جای کرش کل request، به جستجوی keyword-only برمی‌گردیم
+    try:
+        embedding = await embed_text_async(user_message)
+    except Exception as e:
+        logger.warning(f"Ollama embedding unavailable (context=search_hybrid), falling back to keyword-only search: {type(e).__name__}: {e}")
+        return _keyword_only_fallback()
+
+    query_vec = np.array([embedding]).astype("float32")
     faiss.normalize_L2(query_vec)
     k = min(top_k, active_index.ntotal)
     D, I = active_index.search(query_vec, k)
@@ -1078,6 +1179,7 @@ async def select_best_candidate(user_message: str, candidates: list, lang: str =
         ],
         num_predict=3,
         temperature=0,
+        context="select_candidate",
     )
 
     print(f"🔍 Ollama raw response: {repr(raw)}", flush=True)
@@ -1092,16 +1194,19 @@ async def select_best_candidate(user_message: str, candidates: list, lang: str =
             if idx == 0:
                 print("🤖 Ollama: no match", flush=True)
                 return None
+        logger.warning(f"Ollama returned unparseable candidate selection {raw!r} — falling back to top FAISS candidate for query {user_message[:80]!r}")
+        return candidates[0] if candidates else None
 
-    # timeout یا خطا — بهترین FAISS score
+    # raw is None — call_ollama_async already logged the timeout/error detail above
+    logger.warning(f"Ollama candidate-selection unavailable — falling back to top FAISS candidate for query {user_message[:80]!r}")
     return candidates[0] if candidates else None
 
 
 # ═══════════════════════════════════════════════
-#  endpoint اصلی — async
+#  پایپ‌لاین اصلی چت — بدون تغییر منطقی، فقط جابه‌جا شده از داخل endpoint
+#  به یک تابع مستقل تا هم مسیر inline و هم queue worker از آن استفاده کنند.
 # ═══════════════════════════════════════════════
-@app.post("/chat")
-async def chat(req: ChatRequest):
+async def run_chat_pipeline(req: ChatRequest) -> dict:
     user_message = req.message.strip()
     lang = "en" if req.lang == "en" else "fa"
     if not user_message:
@@ -1121,17 +1226,17 @@ async def chat(req: ChatRequest):
         await log_chat_interaction(user_message, ans, "meta", 1.0)
         return {"answer": ans, "source": "meta"}
 
-    # ۱. Query Enricher (sync — CPU)
-    search_query = contextualize_question(user_message, req.history)
+    # ۱. Query Enricher (sync CPU — روی thread جدا تا event loop تک‌پردازه را در بار همزمان بلاک نکند)
+    search_query = await asyncio.to_thread(contextualize_question, user_message, req.history)
 
-    # ۲. Example search (sync — CPU)
-    example_answer, _ = search_examples(search_query)
+    # ۲. Example search (sync CPU — روی thread جدا)
+    example_answer, _ = await asyncio.to_thread(search_examples, search_query)
     if example_answer:
         await log_chat_interaction(user_message, example_answer, "example", 1.0, search_query)
         return {"answer": example_answer, "source": "example"}
 
-    # ۳. Exact / fuzzy search (sync — CPU)
-    exact_item, exact_score = search_exact_knowledge(search_query, lang=lang)
+    # ۳. Exact / fuzzy search (sync CPU — روی thread جدا؛ O(n) روی کل KNOWLEDGE_BASE)
+    exact_item, exact_score = await asyncio.to_thread(search_exact_knowledge, search_query, lang=lang)
     if exact_item:
         ans = _lang_answer(exact_item, lang)
         if exact_item.get("is_directory"):
@@ -1167,6 +1272,124 @@ async def chat(req: ChatRequest):
 
     await log_chat_interaction(user_message, ans, "rag", selected["score"], _lang_question(selected["knowledge"], lang))
     return {"answer": ans, "source": "rag"}
+
+
+# ═══════════════════════════════════════════════
+#  صف /chat — helperها
+# ═══════════════════════════════════════════════
+def _estimate_wait_seconds(position: int) -> int:
+    """تخمین تقریبی — position بر اساس PROCESSING_SLOTS دسته‌بندی و در AVG_PIPELINE_SECONDS ضرب می‌شود."""
+    batches_ahead = -(-position // PROCESSING_SLOTS)  # ceil division
+    return batches_ahead * AVG_PIPELINE_SECONDS
+
+
+def _cleanup_stale_queue_results():
+    """پاک‌سازی نتایج قدیمی از _queue_results — جلوگیری از رشد نامحدود حافظه."""
+    now = time.monotonic()
+    stale_ids = [
+        qid for qid, entry in _queue_results.items()
+        if (entry["state"] == "done" and now - entry["completed_at"] > QUEUE_RESULT_TTL_SECONDS)
+        # شبکه ایمنی: یک job که هرگز worker آن را برنداشته (نباید عملاً رخ دهد چون
+        # worker pool ثابت و FIFO است) هم دیر یا زود پاک می‌شود.
+        or (entry["state"] == "queued" and now - entry["enqueued_at"] > MAX_WAIT_SECONDS + QUEUE_RESULT_TTL_SECONDS)
+    ]
+    for qid in stale_ids:
+        del _queue_results[qid]
+
+
+async def chat_queue_worker(worker_id: int):
+    """
+    یکی از PROCESSING_SLOTS workerهای ثابت — صف را FIFO تخلیه می‌کند.
+    همان pipeline دقیقاً مثل مسیر inline اجرا می‌شود (run_chat_pipeline بدون تغییر).
+    قبل از پردازش، منتظر آزاد شدن یک slot از _slot_semaphore می‌ماند — یعنی مجموع
+    اجرای همزمان pipeline (inline + queue) هرگز از PROCESSING_SLOTS بیشتر نمی‌شود.
+    """
+    global _dequeued_count
+    while True:
+        job = await _job_queue.get()
+        _dequeued_count += 1
+        try:
+            await _slot_semaphore.acquire()
+            try:
+                result = await run_chat_pipeline(job.req)
+                _queue_results[job.queue_id] = {
+                    "state": "done",
+                    "answer": result.get("answer"),
+                    "source": result.get("source"),
+                    "completed_at": time.monotonic(),
+                }
+            finally:
+                _slot_semaphore.release()
+        except Exception as e:
+            logger.warning(f"Queue worker {worker_id} pipeline error (queue_id={job.queue_id}): {type(e).__name__}: {e}")
+            _queue_results[job.queue_id] = {
+                "state": "done",
+                "answer": FALLBACK,
+                "source": "error",
+                "completed_at": time.monotonic(),
+            }
+        finally:
+            _job_queue.task_done()
+
+
+# ═══════════════════════════════════════════════
+#  endpoint اصلی — async
+#  slot آزاد → پردازش inline (دقیقاً مثل قبل، بدون هیچ latency اضافه).
+#  بدون slot → یا صف (تا سقف MAX_QUEUE_DEPTH) یا fast-fail "busy".
+# ═══════════════════════════════════════════════
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    global _next_seq
+
+    if not _slot_semaphore.locked():
+        # هیچ await بین چک بالا و acquire زیر نیست — پس این acquire تضمینی و فوری است
+        # (asyncio تک‌رشته‌ای/cooperative است، پس هیچ coroutine دیگری نمی‌تواند بین این دو خط اجرا شود)
+        await _slot_semaphore.acquire()
+        try:
+            return await run_chat_pipeline(req)
+        finally:
+            _slot_semaphore.release()
+
+    _cleanup_stale_queue_results()
+
+    if _job_queue.qsize() >= MAX_QUEUE_DEPTH:
+        return {"answer": BUSY_MESSAGE_FA, "source": "busy"}
+
+    _next_seq += 1
+    seq = _next_seq
+    queue_id = secrets.token_hex(8)
+    now = time.monotonic()
+    position = seq - _dequeued_count
+
+    _queue_results[queue_id] = {"state": "queued", "seq": seq, "enqueued_at": now}
+    await _job_queue.put(_QueueJob(queue_id=queue_id, req=req, seq=seq, enqueued_at=now))
+
+    return {
+        "status": "queued",
+        "queue_id": queue_id,
+        "position": position,
+        "estimated_wait_seconds": _estimate_wait_seconds(position),
+    }
+
+
+@app.get("/chat/status/{queue_id}")
+async def chat_status(queue_id: str):
+    _cleanup_stale_queue_results()
+
+    entry = _queue_results.get(queue_id)
+    if entry is None:
+        # queue_id نامعتبر/منقضی‌شده — یعنی یا هرگز وجود نداشته یا مدت‌ها پیش پاک‌سازی شده
+        return {"status": "busy"}
+
+    if entry["state"] == "done":
+        return {"status": "done", "answer": entry["answer"], "source": entry["source"]}
+
+    elapsed = time.monotonic() - entry["enqueued_at"]
+    if elapsed >= MAX_WAIT_SECONDS:
+        return {"status": "busy"}
+
+    position = max(entry["seq"] - _dequeued_count, 1)
+    return {"status": "queued", "position": position}
 
 
 # ═══════════════════════════════════════════════
