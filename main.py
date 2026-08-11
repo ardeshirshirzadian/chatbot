@@ -5,6 +5,7 @@ import re
 import secrets
 import string
 import asyncio
+import logging
 from typing import Optional
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -20,6 +21,8 @@ from psycopg2.extras import Json, RealDictCursor
 from fastapi import FastAPI, Header, HTTPException, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════
 #  مسیرها و تنظیمات پایه
@@ -484,106 +487,149 @@ def load_all_knowledge_bases():
 # ═══════════════════════════════════════════════
 #  Rebuild Knowledge Base + FAISS — startup و بعد از هر تغییر admin
 # ═══════════════════════════════════════════════
-async def rebuild_knowledge_base():
+async def rebuild_knowledge_base() -> bool:
     """
     KNOWLEDGE_BASE را از Postgres (FAQ) + CSVها (مثل companies.csv) دوباره می‌سازد،
     فقط آیتم‌های جدید/تغییریافته را embed می‌کند (با استفاده از cache موجود)
     و FAISS index را از نو می‌سازد. global هایی که /chat استفاده می‌کند به‌روز می‌شوند.
+
+    همه چیز ابتدا در متغیرهای local ساخته می‌شود؛ global ها فقط یک‌جا و فقط در
+    انتها — بعد از ساخته‌شدن کامل و بدون خطای هر چیزی — جایگزین می‌شوند. اگر در
+    هر نقطه‌ای (ردیف خراب Postgres، خطای پیش‌بینی‌نشده‌ی embedding، خطای numpy/faiss،
+    یا حتی یک نتیجه‌ی خالی مشکوک) استثنایی رخ دهد، global های قبلی دست‌نخورده
+    باقی می‌مانند — یعنی یک rebuild ناموفق چت‌بات را با داده‌ی قدیمی‌تر ولی سالم
+    نگه می‌دارد، نه اینکه آن را کاملاً خراب کند.
+
+    این تابع از ۵ جای کد صدا زده می‌شود (lifespan startup + ۴ endpoint ادمین) و
+    هیچ‌کدام مقدار برگشتی را چک نمی‌کنند — چون swap فقط در پایان و یکجا انجام
+    می‌شود، همه‌ی آن‌ها به‌طور خودکار محافظت می‌شوند بدون نیاز به تغییر. اگر در
+    آینده caller‌ای بخواهد شکست rebuild را به کاربر ادمین گزارش کند می‌تواند
+    مقدار برگشتی را بررسی کند:
+
+    Returns:
+        True  اگر rebuild کامل و موفق بود (global ها به‌روزرسانی شدند).
+        False اگر rebuild شکست خورد (global های قبلی دست‌نخورده ماندند).
     """
     global KNOWLEDGE_BASE, faiss_index, embedding_dimension
     global faiss_index_en, embedding_dimension_en, KB_EN_INDICES
 
-    KNOWLEDGE_BASE = load_all_knowledge_bases()
-    print(f"✅ Knowledge base loaded: {len(KNOWLEDGE_BASE)} items", flush=True)
+    try:
+        new_kb = load_all_knowledge_bases()
+        print(f"✅ Knowledge base loaded: {len(new_kb)} items", flush=True)
 
-    # ── بارگذاری cache ──
-    cached_embeddings = {}
-    if EMBEDDINGS_CACHE_PATH.exists():
+        # اگر نتیجه‌ی جدید خالی است ولی KNOWLEDGE_BASE فعلی خالی نبود، این یک
+        # rebuild واقعی به یک KB خالی نیست — احتمالاً یک قطعی موقت Postgres است
+        # که در load_faq_from_postgres()/load_companies_from_postgres() بی‌صدا
+        # catch و به [] تبدیل می‌شود (بدون raise کردن استثنا). این را هم شکست
+        # rebuild حساب کن تا داده‌ی سالم فعلی با یک نتیجه‌ی خالی جایگزین نشود.
+        if not new_kb and KNOWLEDGE_BASE:
+            raise RuntimeError(
+                f"load_all_knowledge_bases() returned 0 items while current "
+                f"KNOWLEDGE_BASE has {len(KNOWLEDGE_BASE)} — refusing to replace "
+                f"working data with an empty result"
+            )
+
+        # ── بارگذاری cache ──
+        cached_embeddings = {}
+        if EMBEDDINGS_CACHE_PATH.exists():
+            try:
+                with open(EMBEDDINGS_CACHE_PATH, "r", encoding="utf-8") as f:
+                    cached_embeddings = json.load(f)
+            except Exception:
+                pass
+
+        # ── embedding موازی برای آیتم‌های جدید ──
+        # آیتم‌هایی که cache ندارند همزمان embed می‌شوند (asyncio.gather)
+        # ترتیب new_kb حفظ می‌شود
+        # فیلد question_en_norm (در صورت وجود ترجمه) هم به همین لیست اضافه می‌شود
+        # تا embedding مخصوص جستجوی lang=en هم ساخته شود.
+        keys_to_embed = []
+        for i, item in enumerate(new_kb):
+            if item["question_norm"] not in cached_embeddings:
+                keys_to_embed.append((i, item["question_norm"]))
+            en_norm = item.get("question_en_norm")
+            if en_norm and en_norm not in cached_embeddings:
+                keys_to_embed.append((i, en_norm))
+
+        if keys_to_embed:
+            print(f"🔄 Embedding {len(keys_to_embed)} new items (parallel)...", flush=True)
+            # batch ها را گروه‌بندی کن — ۱۰ تایی تا Ollama اشباع نشود
+            BATCH = 10
+            for batch_start in range(0, len(keys_to_embed), BATCH):
+                batch = keys_to_embed[batch_start: batch_start + BATCH]
+                results = await asyncio.gather(
+                    *[embed_text_async(key) for _, key in batch],
+                    return_exceptions=True
+                )
+                for (idx, key), result in zip(batch, results):
+                    if isinstance(result, Exception):
+                        print(f"⚠️  Embedding error for item {idx}: {result}", flush=True)
+                    else:
+                        cached_embeddings[key] = result
+
+        # ذخیره cache
         try:
-            with open(EMBEDDINGS_CACHE_PATH, "r", encoding="utf-8") as f:
-                cached_embeddings = json.load(f)
+            EMBEDDINGS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(EMBEDDINGS_CACHE_PATH, "w", encoding="utf-8") as f:
+                json.dump(cached_embeddings, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 
-    # ── embedding موازی برای آیتم‌های جدید ──
-    # آیتم‌هایی که cache ندارند همزمان embed می‌شوند (asyncio.gather)
-    # ترتیب KNOWLEDGE_BASE حفظ می‌شود
-    # فیلد question_en_norm (در صورت وجود ترجمه) هم به همین لیست اضافه می‌شود
-    # تا embedding مخصوص جستجوی lang=en هم ساخته شود.
-    keys_to_embed = []
-    for i, item in enumerate(KNOWLEDGE_BASE):
-        if item["question_norm"] not in cached_embeddings:
-            keys_to_embed.append((i, item["question_norm"]))
-        en_norm = item.get("question_en_norm")
-        if en_norm and en_norm not in cached_embeddings:
-            keys_to_embed.append((i, en_norm))
+        # ── ساخت FAISS index ──
+        embedding_list = [
+            cached_embeddings[item["question_norm"]]
+            for item in new_kb
+            if item["question_norm"] in cached_embeddings
+        ]
 
-    if keys_to_embed:
-        print(f"🔄 Embedding {len(keys_to_embed)} new items (parallel)...", flush=True)
-        # batch ها را گروه‌بندی کن — ۱۰ تایی تا Ollama اشباع نشود
-        BATCH = 10
-        for batch_start in range(0, len(keys_to_embed), BATCH):
-            batch = keys_to_embed[batch_start: batch_start + BATCH]
-            results = await asyncio.gather(
-                *[embed_text_async(key) for _, key in batch],
-                return_exceptions=True
-            )
-            for (idx, key), result in zip(batch, results):
-                if isinstance(result, Exception):
-                    print(f"⚠️  Embedding error for item {idx}: {result}", flush=True)
-                else:
-                    cached_embeddings[key] = result
+        if embedding_list:
+            emb_np = np.array(embedding_list).astype("float32")
+            new_embedding_dimension = emb_np.shape[1]
+            faiss.normalize_L2(emb_np)
+            new_index = faiss.IndexFlatIP(new_embedding_dimension)
+            new_index.add(emb_np)
+            new_faiss_index = new_index
+            print(f"✅ FAISS index built: {new_faiss_index.ntotal} vectors", flush=True)
+        else:
+            new_faiss_index = None
+            new_embedding_dimension = None
+            print("⚠️  FAISS index empty.", flush=True)
 
-    # ذخیره cache
-    try:
-        EMBEDDINGS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(EMBEDDINGS_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(cached_embeddings, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        # ── ساخت FAISS index انگلیسی — فقط روی آیتم‌هایی که ترجمه دارند ──
+        # new_kb_en_indices[i] اندیس واقعی در new_kb برای نتیجه i-ام این index است.
+        embedding_list_en = []
+        new_kb_en_indices = []
+        for i, item in enumerate(new_kb):
+            en_norm = item.get("question_en_norm")
+            if en_norm and en_norm in cached_embeddings:
+                embedding_list_en.append(cached_embeddings[en_norm])
+                new_kb_en_indices.append(i)
 
-    # ── ساخت FAISS index ──
-    embedding_list = [
-        cached_embeddings[item["question_norm"]]
-        for item in KNOWLEDGE_BASE
-        if item["question_norm"] in cached_embeddings
-    ]
+        if embedding_list_en:
+            emb_np_en = np.array(embedding_list_en).astype("float32")
+            new_embedding_dimension_en = emb_np_en.shape[1]
+            faiss.normalize_L2(emb_np_en)
+            new_index_en = faiss.IndexFlatIP(new_embedding_dimension_en)
+            new_index_en.add(emb_np_en)
+            new_faiss_index_en = new_index_en
+            print(f"✅ FAISS EN index built: {new_faiss_index_en.ntotal} vectors", flush=True)
+        else:
+            new_faiss_index_en = None
+            new_embedding_dimension_en = None
+            print("⚠️  FAISS EN index empty (no English translations yet).", flush=True)
 
-    if embedding_list:
-        emb_np = np.array(embedding_list).astype("float32")
-        embedding_dimension = emb_np.shape[1]
-        faiss.normalize_L2(emb_np)
-        new_index = faiss.IndexFlatIP(embedding_dimension)
-        new_index.add(emb_np)
-        faiss_index = new_index
-        print(f"✅ FAISS index built: {faiss_index.ntotal} vectors", flush=True)
-    else:
-        faiss_index = None
-        embedding_dimension = None
-        print("⚠️  FAISS index empty.", flush=True)
+        # ── همه چیز بدون خطا ساخته شد — حالا و فقط حالا global ها را یکجا جایگزین کن ──
+        KNOWLEDGE_BASE         = new_kb
+        faiss_index            = new_faiss_index
+        embedding_dimension    = new_embedding_dimension
+        faiss_index_en         = new_faiss_index_en
+        embedding_dimension_en = new_embedding_dimension_en
+        KB_EN_INDICES          = new_kb_en_indices
+        return True
 
-    # ── ساخت FAISS index انگلیسی — فقط روی آیتم‌هایی که ترجمه دارند ──
-    # KB_EN_INDICES[i] اندیس واقعی در KNOWLEDGE_BASE برای نتیجه i-ام این index است.
-    embedding_list_en = []
-    KB_EN_INDICES = []
-    for i, item in enumerate(KNOWLEDGE_BASE):
-        en_norm = item.get("question_en_norm")
-        if en_norm and en_norm in cached_embeddings:
-            embedding_list_en.append(cached_embeddings[en_norm])
-            KB_EN_INDICES.append(i)
-
-    if embedding_list_en:
-        emb_np_en = np.array(embedding_list_en).astype("float32")
-        embedding_dimension_en = emb_np_en.shape[1]
-        faiss.normalize_L2(emb_np_en)
-        new_index_en = faiss.IndexFlatIP(embedding_dimension_en)
-        new_index_en.add(emb_np_en)
-        faiss_index_en = new_index_en
-        print(f"✅ FAISS EN index built: {faiss_index_en.ntotal} vectors", flush=True)
-    else:
-        faiss_index_en = None
-        embedding_dimension_en = None
-        print("⚠️  FAISS EN index empty (no English translations yet).", flush=True)
+    except Exception as e:
+        logger.error(f"rebuild_knowledge_base failed, keeping previous state: {e}", exc_info=True)
+        return False
 
 
 # ═══════════════════════════════════════════════
