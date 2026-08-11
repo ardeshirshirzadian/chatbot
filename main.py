@@ -95,7 +95,7 @@ class _QueueJob:
 #  حالت‌های Global
 # ═══════════════════════════════════════════════
 KNOWLEDGE_BASE  = []
-FALLBACK        = DEFAULT_FALLBACK
+BOT_SETTINGS    = {}   # key → {"fa": value_fa, "en": value_en} — از جدول bot_settings در Postgres
 prompt_config   = {}
 faiss_index     = None
 faiss_index_en  = None   # index موازی روی question_en_norm — فقط آیتم‌هایی که ترجمه انگلیسی دارند
@@ -156,6 +156,32 @@ def load_prompt_config():
     except Exception as e:
         print(f"Warning: Could not load prompt config: {e}")
         return {"fallback": DEFAULT_FALLBACK, "examples": []}
+
+
+def load_bot_settings() -> dict:
+    """
+    همه‌ی ردیف‌های جدول bot_settings را می‌خواند →
+    {key: {"fa": value_fa, "en": value_en}}
+    در startup و بعد از هر تغییر ادمین (PUT /admin/bot-settings/{key}) فراخوانی می‌شود —
+    بدون نیاز به ری‌استارت سرویس.
+    """
+    conn = None
+    try:
+        conn = get_faq_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT key, value_fa, value_en FROM bot_settings")
+            rows = cur.fetchall()
+        return {row[0]: {"fa": row[1], "en": row[2]} for row in rows}
+    except Exception as e:
+        print(f"Warning: Could not load bot settings: {e}")
+        return {}
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_fallback_message(lang: str) -> str:
+    return BOT_SETTINGS.get("fallback_message", {}).get(lang) or DEFAULT_FALLBACK
 
 
 def similarity(a: str, b: str) -> float:
@@ -671,7 +697,7 @@ async def rebuild_knowledge_base() -> bool:
 # ═══════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global FALLBACK, prompt_config, _http, _rewarm_task
+    global BOT_SETTINGS, prompt_config, _http, _rewarm_task
     global _job_queue, _slot_semaphore, _queue_worker_tasks
 
     # ── ساخت httpx client با connection pool ──
@@ -681,7 +707,7 @@ async def lifespan(app: FastAPI):
     )
 
     prompt_config = load_prompt_config()
-    FALLBACK      = prompt_config.get("fallback", DEFAULT_FALLBACK)
+    BOT_SETTINGS  = load_bot_settings()
 
     await rebuild_knowledge_base()
 
@@ -765,6 +791,11 @@ class FAQUpdate(BaseModel):
     answer: str | None = None
     question_en: str | None = None
     answer_en: str | None = None
+
+
+class BotSettingUpdate(BaseModel):
+    value_fa: str | None = None
+    value_en: str | None = None
 
 
 # ═══════════════════════════════════════════════
@@ -1235,7 +1266,7 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
     user_message = req.message.strip()
     lang = "en" if req.lang == "en" else "fa"
     if not user_message:
-        return {"answer": FALLBACK, "source": "empty"}
+        return {"answer": get_fallback_message(lang), "source": "empty"}
 
     # ── بررسی سوالات meta درباره تاریخچه ──
     meta_keywords = ["سوال قبلی", "قبلاً چی گفتم", "قبلا چی گفتم", "آخرین سوالم",
@@ -1272,8 +1303,9 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
     # ۴. FAISS + hybrid (async — شامل embed I/O)
     candidates = await search_hybrid_knowledge(search_query, top_k=10, lang=lang)
     if not candidates:
-        await log_chat_interaction(user_message, FALLBACK, "fallback", 0.0)
-        return {"answer": FALLBACK, "source": "fallback"}
+        fallback = get_fallback_message(lang)
+        await log_chat_interaction(user_message, fallback, "fallback", 0.0)
+        return {"answer": fallback, "source": "fallback"}
 
     print(f"📊 scores: {[round(c['score'],3) for c in candidates]}", flush=True)
 
@@ -1281,14 +1313,16 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
     MIN_SCORE  = 0.50
     candidates = [c for c in candidates if c["score"] >= MIN_SCORE]
     if not candidates:
-        await log_chat_interaction(user_message, FALLBACK, "fallback_threshold", 0.0)
-        return {"answer": FALLBACK, "source": "fallback"}
+        fallback = get_fallback_message(lang)
+        await log_chat_interaction(user_message, fallback, "fallback_threshold", 0.0)
+        return {"answer": fallback, "source": "fallback"}
 
     # ۶. Ollama انتخاب (async — I/O)
     selected = await select_best_candidate(search_query, candidates[:5], lang=lang)
     if not selected:
-        await log_chat_interaction(user_message, FALLBACK, "fallback", 0.0)
-        return {"answer": FALLBACK, "source": "fallback"}
+        fallback = get_fallback_message(lang)
+        await log_chat_interaction(user_message, fallback, "fallback", 0.0)
+        return {"answer": fallback, "source": "fallback"}
 
     # ۷. فرمت و برگشت
     ans = _lang_answer(selected["knowledge"], lang)
@@ -1349,7 +1383,7 @@ async def chat_queue_worker(worker_id: int):
             logger.warning(f"Queue worker {worker_id} pipeline error (queue_id={job.queue_id}): {type(e).__name__}: {e}")
             _queue_results[job.queue_id] = {
                 "state": "done",
-                "answer": FALLBACK,
+                "answer": get_fallback_message("en" if job.req.lang == "en" else "fa"),
                 "source": "error",
                 "completed_at": time.monotonic(),
             }
@@ -1579,6 +1613,51 @@ async def admin_delete_faq(faq_id: str, _: None = Depends(verify_admin_key)):
 
     await rebuild_knowledge_base()
     return {"deleted": True}
+
+
+# ═══════════════════════════════════════════════
+#  Admin — تنظیمات عمومی ربات (Postgres، جدول bot_settings)
+#  همان محافظت X-Admin-Key. بعد از هر تغییر، BOT_SETTINGS بلافاصله از دیتابیس
+#  reload می‌شود — بدون نیاز به ری‌استارت سرویس.
+# ═══════════════════════════════════════════════
+@app.get("/admin/bot-settings")
+async def admin_list_bot_settings(_: None = Depends(verify_admin_key)):
+    return BOT_SETTINGS
+
+
+@app.put("/admin/bot-settings/{key}")
+async def admin_update_bot_setting(key: str, payload: BotSettingUpdate, _: None = Depends(verify_admin_key)):
+    global BOT_SETTINGS
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    set_clauses = [f"{field} = %s" for field in updates] + ["updated_at = NOW()"]
+    values = list(updates.values())
+
+    conn = None
+    try:
+        conn = get_faq_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO bot_settings (key, {", ".join(updates)})
+                VALUES (%s, {", ".join(["%s"] * len(updates))})
+                ON CONFLICT (key) DO UPDATE SET {", ".join(set_clauses)}
+                """,
+                [key] + values + values,
+            )
+        conn.commit()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    BOT_SETTINGS = load_bot_settings()
+    return {"key": key, **BOT_SETTINGS.get(key, {})}
 
 
 # ═══════════════════════════════════════════════
