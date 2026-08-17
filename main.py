@@ -100,6 +100,29 @@ def verify_admin_key(x_admin_key: str | None = Header(None, alias="X-Admin-Key")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+async def wait_for_postgres_ready(max_attempts: int = 15, delay_seconds: int = 2) -> bool:
+    """
+    قبل از اولین rebuild_knowledge_base در startup تلاش می‌کند به همان Postgres
+    که load_bot_settings()/load_all_knowledge_bases() استفاده می‌کنند وصل شود.
+    اگر faq-postgres هم‌زمان با اپ ری‌استارت شده باشد (مثلاً بعد از قطع برق
+    سرور)، ممکن است چند ثانیه "starting up" بماند و اتصال را رد کند — این تابع
+    با یک اتصال سبک و تلاش مجدد منتظر آماده‌شدن آن می‌ماند.
+    """
+    for attempt in range(1, max_attempts + 1):
+        conn = None
+        try:
+            conn = get_faq_db_connection()
+            return True
+        except Exception as e:
+            print(f"⏳ Waiting for Postgres... attempt {attempt}/{max_attempts} ({e})", flush=True)
+            await asyncio.sleep(delay_seconds)
+        finally:
+            if conn:
+                conn.close()
+    print("❌ Postgres did not become ready in time.", flush=True)
+    return False
+
+
 # ═══════════════════════════════════════════════
 #  توابع کمکی sync (CPU-bound — بدون I/O)
 # ═══════════════════════════════════════════════
@@ -668,6 +691,24 @@ async def rebuild_knowledge_base() -> bool:
         return False
 
 
+async def _self_heal_knowledge_base(max_attempts: int = 20, interval_seconds: int = 30):
+    """
+    Safety net: اگر بعد از rebuild_knowledge_base در startup (حتی بعد از
+    wait_for_postgres_ready) KNOWLEDGE_BASE هنوز خالی باشد — به هر دلیلی،
+    نه فقط کندی Postgres — این تابع در background هر ۳۰ ثانیه یک‌بار دوباره
+    rebuild_knowledge_base را امتحان می‌کند تا چت‌بات بدون نیاز به دخالت دستی
+    ادمین (ویرایش یک FAQ) خودش را ظرف چند دقیقه ترمیم کند.
+    """
+    for attempt in range(1, max_attempts + 1):
+        await asyncio.sleep(interval_seconds)
+        print(f"🔄 Self-heal retry {attempt}/{max_attempts}: retrying rebuild_knowledge_base...", flush=True)
+        await rebuild_knowledge_base()
+        if len(KNOWLEDGE_BASE) > 0:
+            print(f"✅ Self-heal succeeded on attempt {attempt}: knowledge base has {len(KNOWLEDGE_BASE)} items.", flush=True)
+            return
+    print(f"❌ Self-heal gave up after {max_attempts} attempts — knowledge base still empty. Manual admin action may be required.", flush=True)
+
+
 # ═══════════════════════════════════════════════
 #  Lifespan — startup / shutdown
 # ═══════════════════════════════════════════════
@@ -684,7 +725,19 @@ async def lifespan(app: FastAPI):
     prompt_config = load_prompt_config()
     BOT_SETTINGS  = load_bot_settings()
 
+    # ── منتظر آماده‌شدن Postgres (مثلاً بعد از ری‌استارت هم‌زمان با اپ) قبل از rebuild اول ──
+    postgres_ready = await wait_for_postgres_ready()
+    if postgres_ready:
+        print("✅ Postgres is ready.", flush=True)
+    else:
+        print("⚠️  Postgres not ready after max wait — proceeding with rebuild anyway.", flush=True)
+
     await rebuild_knowledge_base()
+
+    # ── safety net: اگر KB هنوز خالی است، هر ۳۰ ثانیه در background دوباره امتحان کن ──
+    if len(KNOWLEDGE_BASE) == 0:
+        print("⚠️  Knowledge base is empty after startup rebuild — scheduling background self-heal retries.", flush=True)
+        asyncio.create_task(_self_heal_knowledge_base())
 
     # ── گرم کردن مدل chat در Ollama (لود در GPU قبل از اولین درخواست) ──
     print("🔥 Warming up Ollama chat model...", flush=True)
