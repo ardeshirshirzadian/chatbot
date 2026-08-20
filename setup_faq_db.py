@@ -16,7 +16,11 @@ CREATE TABLE IF NOT EXISTS faq (
     question TEXT NOT NULL,
     answer TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+    updated_at TIMESTAMP DEFAULT NOW(),
+    question_en TEXT,
+    answer_en TEXT,
+    synced_to_primary BOOLEAN DEFAULT true,
+    event_id INTEGER NOT NULL DEFAULT 1
 );
 """
 

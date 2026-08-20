@@ -18,7 +18,7 @@ import numpy as np
 import faiss
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
-from fastapi import FastAPI, Header, HTTPException, Depends, Body
+from fastapi import FastAPI, Header, HTTPException, Depends, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -47,24 +47,27 @@ DEFAULT_FALLBACK = "این سؤال خارج از حوزه نمایشگاه ای
 _http: httpx.AsyncClient = None
 
 # ═══════════════════════════════════════════════
-#  حالت‌های Global
+#  حالت‌های Global — یک FAISS index/KB جدا به‌ازای هر local event_id
+#  (معماری انتخاب‌شده: هزینه‌ی حافظه‌ی بیشتر به‌جای یک index مشترک با فیلتر
+#  metadata — trade-off آگاهانه، فعلاً فقط event_id=1 و 2 داریم)
 # ═══════════════════════════════════════════════
-KNOWLEDGE_BASE  = []
+KNOWLEDGE_BASE  = {}   # dict[int, list] — {event_id: [item, ...]}
 prompt_config   = {}
 
-# ── bot_settings (Postgres) — تنظیمات سراسری bot، admin-editable بدون ری‌استارت ──
+# ── bot_settings (Postgres) — تنظیمات سراسری bot به‌ازای هر event، admin-editable بدون ری‌استارت ──
 # در startup و بعد از هر PUT /admin/bot-settings/{key} دوباره پر می‌شود.
-# شکل: {key: {"fa": value_fa, "en": value_en}}
+# شکل: {event_id: {key: {"fa": value_fa, "en": value_en}}}
 BOT_SETTINGS    = {}
-faiss_index     = None
-embedding_dimension = None
+faiss_index     = {}   # dict[int, faiss.IndexFlatIP]
+embedding_dimension = {}   # dict[int, int]
 
 # ── English-mode FAISS index (فقط آیتم‌هایی که ترجمه انگلیسی دارند) ──
-# faiss_index_en روی زیرمجموعه‌ای از KNOWLEDGE_BASE ساخته می‌شود؛ KB_EN_INDICES[i]
-# اندیس واقعی آیتم در KNOWLEDGE_BASE را برای نتیجه i-ام جستجوی FAISS انگلیسی برمی‌گرداند.
-faiss_index_en       = None
-embedding_dimension_en = None
-KB_EN_INDICES        = []
+# faiss_index_en[event_id] روی زیرمجموعه‌ای از KNOWLEDGE_BASE[event_id] ساخته می‌شود؛
+# KB_EN_INDICES[event_id][i] اندیس واقعی آیتم در KNOWLEDGE_BASE[event_id] را برای
+# نتیجه i-ام جستجوی FAISS انگلیسی همان event برمی‌گرداند.
+faiss_index_en       = {}   # dict[int, faiss.IndexFlatIP]
+embedding_dimension_en = {}   # dict[int, int]
+KB_EN_INDICES        = {}   # dict[int, list]
 
 # قفل نوشتن لاگ — جلوگیری از race condition هنگام درخواست‌های همزمان
 _log_lock = asyncio.Lock()
@@ -147,9 +150,10 @@ def load_prompt_config():
 
 def load_bot_settings() -> dict:
     """
-    جدول bot_settings را از Postgres می‌خواند — یک تنظیمات key-value سراسری
-    برای bot (فعلاً فقط fallback_message، ولی برای تنظیمات آینده هم شکل مناسبی دارد).
-    خروجی: {key: {"fa": value_fa, "en": value_en}}
+    جدول bot_settings را از Postgres می‌خواند — تنظیمات key-value به‌ازای هر
+    local event_id (فعلاً فقط fallback_message، ولی برای تنظیمات آینده هم شکل
+    مناسبی دارد). PK جدول (event_id, key) است.
+    خروجی: {event_id: {key: {"fa": value_fa, "en": value_en}}}
     در startup و بعد از هر PUT /admin/bot-settings/{key} دوباره فراخوانی می‌شود —
     یعنی تغییرات بدون نیاز به ری‌استارت روی درخواست بعدی اعمال می‌شوند.
     """
@@ -157,7 +161,7 @@ def load_bot_settings() -> dict:
     try:
         conn = get_faq_db_connection()
         with conn.cursor() as cur:
-            cur.execute("SELECT key, value_fa, value_en FROM bot_settings")
+            cur.execute("SELECT event_id, key, value_fa, value_en FROM bot_settings")
             rows = cur.fetchall()
     except Exception as e:
         print(f"Warning: Could not load bot_settings: {e}", flush=True)
@@ -165,16 +169,20 @@ def load_bot_settings() -> dict:
     finally:
         if conn:
             conn.close()
-    return {row[0]: {"fa": row[1], "en": row[2]} for row in rows}
+    settings_by_event: dict = {}
+    for event_id, key, value_fa, value_en in rows:
+        settings_by_event.setdefault(event_id, {})[key] = {"fa": value_fa, "en": value_en}
+    return settings_by_event
 
 
-def get_fallback_message(lang: str) -> str:
+def get_fallback_message(event_id: int, lang: str) -> str:
     """
-    پیام fallback را برای زبان درخواست از BOT_SETTINGS برمی‌گرداند.
-    اگر مقدار دیتابیس برای این زبان خالی/موجود نبود، DEFAULT_FALLBACK
-    (هاردکد در کد، همیشه در دسترس) به‌عنوان آخرین لایه‌ی امن استفاده می‌شود.
+    پیام fallback را برای event/زبان درخواست از BOT_SETTINGS برمی‌گرداند.
+    اگر مقدار دیتابیس برای این event/زبان خالی/موجود نبود (مثلاً eventـی که
+    هنوز هیچ bot_settings ندارد)، DEFAULT_FALLBACK (هاردکد در کد، همیشه در
+    دسترس) به‌عنوان آخرین لایه‌ی امن استفاده می‌شود.
     """
-    return BOT_SETTINGS.get("fallback_message", {}).get(lang) or DEFAULT_FALLBACK
+    return BOT_SETTINGS.get(event_id, {}).get("fallback_message", {}).get(lang) or DEFAULT_FALLBACK
 
 
 def similarity(a: str, b: str) -> float:
@@ -256,18 +264,42 @@ async def warmup_ollama_model():
 # ═══════════════════════════════════════════════
 #  لاگ async — بدون race condition
 # ═══════════════════════════════════════════════
-async def log_chat_interaction(user_msg: str, bot_ans: str, source: str, score: float, matched_q: str = ""):
+LOG_HEADER = ["Timestamp", "User_Message", "Bot_Answer", "Source", "Score", "Matched_Question", "Event_Id"]
+
+
+def _migrate_log_header_if_stale():
+    """
+    اگر chat_logs.csv از قبل با header قدیمی (بدون ستون Event_Id) وجود دارد،
+    فایل قدیمی را کنار می‌گذارد (rename با timestamp) تا نوشتن بعدی یک فایل
+    تازه با header جدید بسازد. فقط یک‌بار لازم است اجرا شود — بعد از اولین
+    self-heal، فایل جدید همیشه header درست را دارد. صدا زدن این تابع باید زیر
+    _log_lock باشد (توسط caller تضمین می‌شود).
+    """
+    if not LOG_FILE_PATH.exists():
+        return
+    try:
+        with open(LOG_FILE_PATH, newline="", encoding="utf-8-sig") as f:
+            first_line = f.readline()
+        if "Event_Id" not in first_line:
+            stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            LOG_FILE_PATH.rename(LOG_FILE_PATH.with_name(f"{LOG_FILE_PATH.stem}.pre-event-migration-{stamp}.csv"))
+    except Exception:
+        pass
+
+
+async def log_chat_interaction(user_msg: str, bot_ans: str, source: str, score: float, matched_q: str = "", event_id: int | None = None):
     async with _log_lock:
         try:
+            _migrate_log_header_if_stale()
             file_exists = LOG_FILE_PATH.exists()
             LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
             with open(LOG_FILE_PATH, mode="a", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
                 if not file_exists:
-                    writer.writerow(["Timestamp", "User_Message", "Bot_Answer", "Source", "Score", "Matched_Question"])
+                    writer.writerow(LOG_HEADER)
                 writer.writerow([
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    user_msg, bot_ans, source, score, matched_q
+                    user_msg, bot_ans, source, score, matched_q, event_id
                 ])
         except Exception:
             pass
@@ -276,17 +308,30 @@ async def log_chat_interaction(user_msg: str, bot_ans: str, source: str, score: 
 # ═══════════════════════════════════════════════
 #  بارگذاری Knowledge Base (sync — فقط startup / rebuild)
 # ═══════════════════════════════════════════════
-def load_faq_from_postgres():
-    """FAQ items از جدول Postgres `faq` — جایگزین knowledge/faq.csv."""
+def load_faq_from_postgres(event_id: int | None = None):
+    """
+    FAQ items از جدول Postgres `faq` — جایگزین knowledge/faq.csv.
+    اگر event_id داده شود فقط ردیف‌های همان event خوانده می‌شوند (rebuild
+    تک‌event، برای efficiency)؛ در غیر این صورت همه‌ی ردیف‌های همه‌ی eventها در
+    یک کوئری خوانده می‌شوند (rebuild کامل — گروه‌بندی بر اساس event_id در
+    load_all_knowledge_bases انجام می‌شود، نه اینجا).
+    """
     faq_items = []
     try:
         conn = get_faq_db_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, category, question, answer, question_en, answer_en "
-                    "FROM faq ORDER BY created_at"
-                )
+                if event_id is not None:
+                    cur.execute(
+                        "SELECT id, category, question, answer, question_en, answer_en, event_id "
+                        "FROM faq WHERE event_id = %s ORDER BY created_at",
+                        (event_id,),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT id, category, question, answer, question_en, answer_en, event_id "
+                        "FROM faq ORDER BY created_at"
+                    )
                 rows = cur.fetchall()
         finally:
             conn.close()
@@ -294,7 +339,7 @@ def load_faq_from_postgres():
         print(f"Error loading FAQ from Postgres: {e}", flush=True)
         return faq_items
 
-    for row_id, category, question, answer, question_en, answer_en in rows:
+    for row_id, category, question, answer, question_en, answer_en, row_event_id in rows:
         question = (question or "").strip()
         answer   = (answer or "").strip()
         category = (category or "عمومی").strip()
@@ -303,6 +348,7 @@ def load_faq_from_postgres():
         if question and answer:
             item = {
                 "id": row_id,
+                "event_id": row_event_id,
                 "category": category,
                 "question": question,
                 "question_norm": normalize_text(question),
@@ -342,20 +388,27 @@ def _format_jsonish_field(value) -> str:
     return str(value)
 
 
-def load_companies_from_postgres():
-    """آیتم‌های دایرکتوری شرکت‌ها از جدول Postgres `companies` — جایگزین knowledge/companies.csv."""
+def load_companies_from_postgres(event_id: int | None = None):
+    """
+    آیتم‌های دایرکتوری شرکت‌ها از جدول Postgres `companies` — جایگزین
+    knowledge/companies.csv. اگر event_id داده شود فقط شرکت‌های همان event
+    خوانده می‌شوند (rebuild تک‌event)؛ در غیر این صورت همه‌ی eventها در یک
+    کوئری خوانده می‌شوند (گروه‌بندی در load_all_knowledge_bases).
+    """
     company_items = []
     try:
         conn = get_faq_db_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT id, brand_name_fa, brand_name_en, hall_name, booth_no, website,
-                           phones, emails, address_fa, address_en, description_en
-                    FROM companies
-                    """
+                base_query = (
+                    "SELECT id, brand_name_fa, brand_name_en, hall_name, booth_no, website, "
+                    "phones, emails, address_fa, address_en, description_en, event_id "
+                    "FROM companies"
                 )
+                if event_id is not None:
+                    cur.execute(base_query + " WHERE event_id = %s", (event_id,))
+                else:
+                    cur.execute(base_query)
                 rows = cur.fetchall()
         finally:
             conn.close()
@@ -364,7 +417,7 @@ def load_companies_from_postgres():
         return company_items
 
     for (row_id, brand_name_fa, brand_name_en, hall_name, booth_no, website,
-         phones, emails, address_fa, address_en, description_en) in rows:
+         phones, emails, address_fa, address_en, description_en, row_event_id) in rows:
         company_name = (brand_name_fa or "").strip()
         if not company_name:
             continue
@@ -401,6 +454,7 @@ def load_companies_from_postgres():
 
         item = {
             "id": f"company_{row_id}",
+            "event_id": row_event_id,
             "category": category,
             "question": question,
             "question_norm": normalize_text(question),
@@ -460,13 +514,37 @@ def load_companies_from_postgres():
     return company_items
 
 
-def load_all_knowledge_bases():
-    knowledge_list = load_faq_from_postgres()
-    knowledge_list.extend(load_companies_from_postgres())
+def load_all_knowledge_bases(event_id: int | None = None) -> dict:
+    """
+    خروجی: {event_id: [item, ...]} — یک KB جدا به‌ازای هر local event_id.
+    اگر event_id داده شود، فقط همان event از Postgres خوانده می‌شود (rebuild
+    تک‌event، سریع‌تر)؛ در غیر این صورت همه‌ی ردیف‌های همه‌ی eventها در یک
+    کوئری خوانده و اینجا در پایتون بر اساس event_id گروه‌بندی می‌شوند
+    (rebuild کامل — به‌جای N کوئری جدا به‌ازای هر event).
+    فایل‌های CSV قدیمی (اگر باقی مانده باشند) هیچ event_id‌ای ندارند — به‌طور
+    پیش‌فرض به event_id=1 نسبت داده می‌شوند.
+    """
+    knowledge_list = load_faq_from_postgres(event_id)
+    knowledge_list.extend(load_companies_from_postgres(event_id))
 
-    if not KNOWLEDGE_DIR.exists():
-        return knowledge_list
+    csv_items = []
+    if KNOWLEDGE_DIR.exists() and (event_id is None or event_id == 1):
+        csv_items = _load_csv_knowledge_items()
 
+    by_event: dict = {}
+    for item in knowledge_list:
+        by_event.setdefault(item["event_id"], []).append(item)
+    for item in csv_items:
+        by_event.setdefault(1, []).append(item)
+
+    return by_event
+
+
+def _load_csv_knowledge_items() -> list:
+    """CSV fallback (companies.csv/faq.csv دیگر استفاده نمی‌شوند، فقط فایل‌های
+    دیگر) — بدون مفهوم event، همیشه به event_id=1 نسبت داده می‌شود (در
+    load_all_knowledge_bases)."""
+    knowledge_list = []
     # faq.csv و companies.csv دیگر خوانده نمی‌شوند — هر دو اکنون از Postgres می‌آیند.
     # هر فایل CSV دیگری (در صورت وجود) طبق منطق قبلی پردازش می‌شود.
     csv_files = [
@@ -545,25 +623,69 @@ def load_all_knowledge_bases():
 
 # ═══════════════════════════════════════════════
 #  Rebuild Knowledge Base + FAISS — startup و بعد از هر تغییر admin
+#  یک KB/FAISS جدا به‌ازای هر local event_id — نه یک index مشترک با فیلتر.
 # ═══════════════════════════════════════════════
-async def rebuild_knowledge_base() -> bool:
+def _build_faiss_for_items(kb_items: list, cached_embeddings: dict):
     """
-    KNOWLEDGE_BASE را از Postgres (FAQ) + CSVها (مثل companies.csv) دوباره می‌سازد،
-    فقط آیتم‌های جدید/تغییریافته را embed می‌کند (با استفاده از cache موجود)
-    و FAISS index را از نو می‌سازد. global هایی که /chat استفاده می‌کند به‌روز می‌شوند.
+    FAISS index (+ نسخه‌ی انگلیسی) را برای لیست آیتم‌های یک event می‌سازد،
+    با استفاده از cached_embeddings مشترک (کلید = متن نرمال‌شده، بین eventها
+    به اشتراک گذاشته می‌شود — دو event با متن سؤال یکسان می‌توانند از یک
+    embedding استفاده کنند، کاملاً بی‌خطر).
+    خروجی: (faiss_index, embedding_dimension, faiss_index_en, embedding_dimension_en, kb_en_indices)
+    """
+    embedding_list = [
+        cached_embeddings[item["question_norm"]]
+        for item in kb_items
+        if item["question_norm"] in cached_embeddings
+    ]
+    if embedding_list:
+        emb_np = np.array(embedding_list).astype("float32")
+        dim = emb_np.shape[1]
+        faiss.normalize_L2(emb_np)
+        index = faiss.IndexFlatIP(dim)
+        index.add(emb_np)
+    else:
+        index, dim = None, None
+
+    embedding_list_en = []
+    kb_en_indices = []
+    for i, item in enumerate(kb_items):
+        en_norm = item.get("question_en_norm")
+        if en_norm and en_norm in cached_embeddings:
+            embedding_list_en.append(cached_embeddings[en_norm])
+            kb_en_indices.append(i)
+
+    if embedding_list_en:
+        emb_np_en = np.array(embedding_list_en).astype("float32")
+        dim_en = emb_np_en.shape[1]
+        faiss.normalize_L2(emb_np_en)
+        index_en = faiss.IndexFlatIP(dim_en)
+        index_en.add(emb_np_en)
+    else:
+        index_en, dim_en = None, None
+
+    return index, dim, index_en, dim_en, kb_en_indices
+
+
+async def rebuild_knowledge_base(event_id: int | None = None) -> bool:
+    """
+    KNOWLEDGE_BASE[event] را از Postgres (FAQ+companies) + CSVها دوباره می‌سازد،
+    فقط آیتم‌های جدید/تغییریافته را embed می‌کند (با استفاده از cache مشترک) و
+    FAISS index هر event را از نو می‌سازد. global های دیکشنری‌شده‌ای که /chat
+    استفاده می‌کند به‌روز می‌شوند.
+
+    event_id=None (پیش‌فرض؛ lifespan startup و self-heal استفاده می‌کنند):
+        rebuild کامل — همه‌ی eventهای موجود در داده از نو ساخته می‌شوند؛
+        eventـی که دیگر هیچ ردیفی ندارد به لیست خالی می‌رسد (نه اینکه داده‌ی
+        قدیمی‌اش برای همیشه بماند).
+    event_id=<int> (endpointهای admin بعد از یک نوشتن موفق در Postgres):
+        فقط KB/FAISS همان یک event دوباره ساخته می‌شود — سریع‌تر، به بقیه‌ی
+        eventها دست نمی‌زند.
 
     همه چیز ابتدا در متغیرهای local ساخته می‌شود؛ global ها فقط یک‌جا و فقط در
     انتها — بعد از ساخته‌شدن کامل و بدون خطای هر چیزی — جایگزین می‌شوند. اگر در
-    هر نقطه‌ای (ردیف خراب Postgres، خطای پیش‌بینی‌نشده‌ی embedding، خطای numpy/faiss،
-    یا حتی یک نتیجه‌ی خالی مشکوک) استثنایی رخ دهد، global های قبلی دست‌نخورده
-    باقی می‌مانند — یعنی یک rebuild ناموفق چت‌بات را با داده‌ی قدیمی‌تر ولی سالم
-    نگه می‌دارد، نه اینکه آن را کاملاً خراب کند.
-
-    این تابع از ۵ جای کد صدا زده می‌شود (lifespan startup + ۴ endpoint ادمین) و
-    هیچ‌کدام مقدار برگشتی را چک نمی‌کنند — چون swap فقط در پایان و یکجا انجام
-    می‌شود، همه‌ی آن‌ها به‌طور خودکار محافظت می‌شوند بدون نیاز به تغییر. اگر در
-    آینده caller‌ای بخواهد شکست rebuild را به کاربر ادمین گزارش کند می‌تواند
-    مقدار برگشتی را بررسی کند:
+    هر نقطه‌ای (ردیف خراب Postgres، خطای پیش‌بینی‌نشده‌ی embedding، خطای numpy/faiss)
+    استثنایی رخ دهد، global های قبلی دست‌نخورده باقی می‌مانند.
 
     Returns:
         True  اگر rebuild کامل و موفق بود (global ها به‌روزرسانی شدند).
@@ -573,22 +695,39 @@ async def rebuild_knowledge_base() -> bool:
     global faiss_index_en, embedding_dimension_en, KB_EN_INDICES
 
     try:
-        new_kb = load_all_knowledge_bases()
-        print(f"✅ Knowledge base loaded: {len(new_kb)} items", flush=True)
+        new_kb_by_event = load_all_knowledge_bases(event_id)
+        total_items = sum(len(v) for v in new_kb_by_event.values())
+        scope = f"event_id={event_id}" if event_id is not None else "full rebuild"
+        print(f"✅ Knowledge base loaded: {total_items} items across {len(new_kb_by_event)} event(s) ({scope})", flush=True)
 
-        # اگر نتیجه‌ی جدید خالی است ولی KNOWLEDGE_BASE فعلی خالی نبود، این یک
-        # rebuild واقعی به یک KB خالی نیست — احتمالاً یک قطعی موقت Postgres است
-        # که در load_faq_from_postgres()/load_companies_from_postgres() بی‌صدا
-        # catch و به [] تبدیل می‌شود (بدون raise کردن استثنا). این را هم شکست
-        # rebuild حساب کن تا داده‌ی سالم فعلی با یک نتیجه‌ی خالی جایگزین نشود.
-        if not new_kb and KNOWLEDGE_BASE:
-            raise RuntimeError(
-                f"load_all_knowledge_bases() returned 0 items while current "
-                f"KNOWLEDGE_BASE has {len(KNOWLEDGE_BASE)} — refusing to replace "
-                f"working data with an empty result"
-            )
+        if event_id is None:
+            # rebuild کامل — اگر نتیجه‌ی جدید کاملاً خالی است ولی KNOWLEDGE_BASE
+            # فعلی خالی نبود، این احتمالاً یک قطعی موقت Postgres است (که
+            # load_faq_from_postgres/load_companies_from_postgres بی‌صدا catch و
+            # به [] تبدیل می‌کنند، بدون raise) — رفتار قبلی حفظ می‌شود: کل
+            # rebuild را شکست‌خورده حساب کن تا داده‌ی سالم با نتیجه‌ی خالی
+            # جایگزین نشود. این چک عمداً روی مجموع کل eventهاست، نه تک‌تک
+            # eventها — یک event که واقعاً همه‌ی FAQهایش حذف شده نباید کل
+            # rebuild چندeventی را متوقف کند.
+            current_total = sum(len(v) for v in KNOWLEDGE_BASE.values())
+            if total_items == 0 and current_total > 0:
+                raise RuntimeError(
+                    f"load_all_knowledge_bases() returned 0 items total while current "
+                    f"KNOWLEDGE_BASE has {current_total} across {len(KNOWLEDGE_BASE)} event(s) — "
+                    f"refusing to replace working data with an empty result"
+                )
+            # rebuild کامل مرجع همه‌ی eventهای شناخته‌شده است.
+            for ev in KNOWLEDGE_BASE:
+                new_kb_by_event.setdefault(ev, [])
+        else:
+            # rebuild تک‌event همیشه بلافاصله بعد از یک نوشتن موفق در همان event
+            # در Postgres صدا زده می‌شود (از endpointهای admin) — یعنی Postgres
+            # همین الان در دسترس بوده، پس نتیجه‌ی خالی اینجا یک قطعی مشکوک
+            # نیست، یک وضعیت واقعی است (مثلاً آخرین FAQ آن event حذف شده) —
+            # بدون گارد اعمال می‌شود.
+            new_kb_by_event.setdefault(event_id, [])
 
-        # ── بارگذاری cache ──
+        # ── بارگذاری cache (مشترک بین همه‌ی eventها) ──
         cached_embeddings = {}
         if EMBEDDINGS_CACHE_PATH.exists():
             try:
@@ -597,18 +736,16 @@ async def rebuild_knowledge_base() -> bool:
             except Exception:
                 pass
 
-        # ── embedding موازی برای آیتم‌های جدید ──
-        # آیتم‌هایی که cache ندارند همزمان embed می‌شوند (asyncio.gather)
-        # ترتیب new_kb حفظ می‌شود
-        # فیلد question_en_norm (در صورت وجود ترجمه) هم به همین لیست اضافه می‌شود
-        # تا embedding مخصوص جستجوی lang=en هم ساخته شود.
+        # ── embedding موازی برای آیتم‌های جدید (روی همه‌ی eventهای این rebuild، یکجا) ──
+        all_new_items = [item for items in new_kb_by_event.values() for item in items]
         keys_to_embed = []
-        for i, item in enumerate(new_kb):
+        for item in all_new_items:
             if item["question_norm"] not in cached_embeddings:
-                keys_to_embed.append((i, item["question_norm"]))
+                keys_to_embed.append(item["question_norm"])
             en_norm = item.get("question_en_norm")
             if en_norm and en_norm not in cached_embeddings:
-                keys_to_embed.append((i, en_norm))
+                keys_to_embed.append(en_norm)
+        keys_to_embed = list(dict.fromkeys(keys_to_embed))  # حذف تکراری، ترتیب حفظ می‌شود
 
         if keys_to_embed:
             print(f"🔄 Embedding {len(keys_to_embed)} new items (parallel)...", flush=True)
@@ -617,12 +754,12 @@ async def rebuild_knowledge_base() -> bool:
             for batch_start in range(0, len(keys_to_embed), BATCH):
                 batch = keys_to_embed[batch_start: batch_start + BATCH]
                 results = await asyncio.gather(
-                    *[embed_text_async(key) for _, key in batch],
+                    *[embed_text_async(key) for key in batch],
                     return_exceptions=True
                 )
-                for (idx, key), result in zip(batch, results):
+                for key, result in zip(batch, results):
                     if isinstance(result, Exception):
-                        print(f"⚠️  Embedding error for item {idx}: {result}", flush=True)
+                        print(f"⚠️  Embedding error for '{key[:50]}': {result}", flush=True)
                     else:
                         cached_embeddings[key] = result
 
@@ -634,56 +771,31 @@ async def rebuild_knowledge_base() -> bool:
         except Exception:
             pass
 
-        # ── ساخت FAISS index ──
-        embedding_list = [
-            cached_embeddings[item["question_norm"]]
-            for item in new_kb
-            if item["question_norm"] in cached_embeddings
-        ]
+        # ── ساخت FAISS index به‌ازای هر event ──
+        new_indices, new_dims = {}, {}
+        new_indices_en, new_dims_en, new_kb_en_by_event = {}, {}, {}
+        for ev, items in new_kb_by_event.items():
+            idx, dim, idx_en, dim_en, en_indices = _build_faiss_for_items(items, cached_embeddings)
+            new_indices[ev] = idx
+            new_dims[ev] = dim
+            new_indices_en[ev] = idx_en
+            new_dims_en[ev] = dim_en
+            new_kb_en_by_event[ev] = en_indices
+            print(
+                f"✅ event_id={ev}: FAISS {idx.ntotal if idx else 0} vectors, "
+                f"EN {idx_en.ntotal if idx_en else 0} vectors ({len(items)} items)",
+                flush=True,
+            )
 
-        if embedding_list:
-            emb_np = np.array(embedding_list).astype("float32")
-            new_embedding_dimension = emb_np.shape[1]
-            faiss.normalize_L2(emb_np)
-            new_index = faiss.IndexFlatIP(new_embedding_dimension)
-            new_index.add(emb_np)
-            new_faiss_index = new_index
-            print(f"✅ FAISS index built: {new_faiss_index.ntotal} vectors", flush=True)
-        else:
-            new_faiss_index = None
-            new_embedding_dimension = None
-            print("⚠️  FAISS index empty.", flush=True)
-
-        # ── ساخت FAISS index انگلیسی — فقط روی آیتم‌هایی که ترجمه دارند ──
-        # new_kb_en_indices[i] اندیس واقعی در new_kb برای نتیجه i-ام این index است.
-        embedding_list_en = []
-        new_kb_en_indices = []
-        for i, item in enumerate(new_kb):
-            en_norm = item.get("question_en_norm")
-            if en_norm and en_norm in cached_embeddings:
-                embedding_list_en.append(cached_embeddings[en_norm])
-                new_kb_en_indices.append(i)
-
-        if embedding_list_en:
-            emb_np_en = np.array(embedding_list_en).astype("float32")
-            new_embedding_dimension_en = emb_np_en.shape[1]
-            faiss.normalize_L2(emb_np_en)
-            new_index_en = faiss.IndexFlatIP(new_embedding_dimension_en)
-            new_index_en.add(emb_np_en)
-            new_faiss_index_en = new_index_en
-            print(f"✅ FAISS EN index built: {new_faiss_index_en.ntotal} vectors", flush=True)
-        else:
-            new_faiss_index_en = None
-            new_embedding_dimension_en = None
-            print("⚠️  FAISS EN index empty (no English translations yet).", flush=True)
-
-        # ── همه چیز بدون خطا ساخته شد — حالا و فقط حالا global ها را یکجا جایگزین کن ──
-        KNOWLEDGE_BASE         = new_kb
-        faiss_index            = new_faiss_index
-        embedding_dimension    = new_embedding_dimension
-        faiss_index_en         = new_faiss_index_en
-        embedding_dimension_en = new_embedding_dimension_en
-        KB_EN_INDICES          = new_kb_en_indices
+        # ── همه چیز بدون خطا ساخته شد — حالا و فقط حالا global ها را جایگزین کن ──
+        # فقط کلیدهای موجود در new_kb_by_event عوض می‌شوند — در rebuild تک‌event
+        # بقیه‌ی eventها کاملاً دست‌نخورده می‌مانند.
+        KNOWLEDGE_BASE.update(new_kb_by_event)
+        faiss_index.update(new_indices)
+        embedding_dimension.update(new_dims)
+        faiss_index_en.update(new_indices_en)
+        embedding_dimension_en.update(new_dims_en)
+        KB_EN_INDICES.update(new_kb_en_by_event)
         return True
 
     except Exception as e:
@@ -694,17 +806,18 @@ async def rebuild_knowledge_base() -> bool:
 async def _self_heal_knowledge_base(max_attempts: int = 20, interval_seconds: int = 30):
     """
     Safety net: اگر بعد از rebuild_knowledge_base در startup (حتی بعد از
-    wait_for_postgres_ready) KNOWLEDGE_BASE هنوز خالی باشد — به هر دلیلی،
+    wait_for_postgres_ready) هیچ eventـی KB غیرخالی نداشته باشد — به هر دلیلی،
     نه فقط کندی Postgres — این تابع در background هر ۳۰ ثانیه یک‌بار دوباره
-    rebuild_knowledge_base را امتحان می‌کند تا چت‌بات بدون نیاز به دخالت دستی
-    ادمین (ویرایش یک FAQ) خودش را ظرف چند دقیقه ترمیم کند.
+    rebuild_knowledge_base (کامل) را امتحان می‌کند تا چت‌بات بدون نیاز به دخالت
+    دستی ادمین خودش را ظرف چند دقیقه ترمیم کند.
     """
     for attempt in range(1, max_attempts + 1):
         await asyncio.sleep(interval_seconds)
         print(f"🔄 Self-heal retry {attempt}/{max_attempts}: retrying rebuild_knowledge_base...", flush=True)
         await rebuild_knowledge_base()
-        if len(KNOWLEDGE_BASE) > 0:
-            print(f"✅ Self-heal succeeded on attempt {attempt}: knowledge base has {len(KNOWLEDGE_BASE)} items.", flush=True)
+        if any(len(kb) > 0 for kb in KNOWLEDGE_BASE.values()):
+            total = sum(len(kb) for kb in KNOWLEDGE_BASE.values())
+            print(f"✅ Self-heal succeeded on attempt {attempt}: knowledge base has {total} items across {len(KNOWLEDGE_BASE)} event(s).", flush=True)
             return
     print(f"❌ Self-heal gave up after {max_attempts} attempts — knowledge base still empty. Manual admin action may be required.", flush=True)
 
@@ -734,8 +847,8 @@ async def lifespan(app: FastAPI):
 
     await rebuild_knowledge_base()
 
-    # ── safety net: اگر KB هنوز خالی است، هر ۳۰ ثانیه در background دوباره امتحان کن ──
-    if len(KNOWLEDGE_BASE) == 0:
+    # ── safety net: اگر هیچ eventـی KB غیرخالی ندارد، هر ۳۰ ثانیه در background دوباره امتحان کن ──
+    if not any(len(kb) > 0 for kb in KNOWLEDGE_BASE.values()):
         print("⚠️  Knowledge base is empty after startup rebuild — scheduling background self-heal retries.", flush=True)
         asyncio.create_task(_self_heal_knowledge_base())
 
@@ -769,7 +882,12 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "knowledge_base_items": len(KNOWLEDGE_BASE) if KNOWLEDGE_BASE is not None else 0}
+    by_event = {str(ev): len(kb) for ev, kb in KNOWLEDGE_BASE.items()}
+    return {
+        "status": "ok",
+        "knowledge_base_items": sum(by_event.values()),
+        "knowledge_base_items_by_event": by_event,
+    }
 
 
 class ChatMessage(BaseModel):
@@ -781,6 +899,7 @@ class ChatRequest(BaseModel):
     message: str
     history: list[ChatMessage] = []
     lang: str = "fa"
+    event_id: int
 
 
 class FAQCreate(BaseModel):
@@ -1086,10 +1205,15 @@ def _answer_for_lang(item: dict, lang: str) -> str:
     return item["answer"]
 
 
-def search_exact_knowledge(user_message: str, lang: str = "fa"):
+def search_exact_knowledge(user_message: str, knowledge_base: list, lang: str = "fa"):
+    """
+    knowledge_base اکنون به‌صورت صریح پاس داده می‌شود (لیست آیتم‌های همان event) —
+    نه global مستقیم، چون درخواست‌های همزمان ممکن است متعلق به eventهای
+    متفاوت باشند و نباید global مشترکی را per-request جابه‌جا کرد (race).
+    """
     user_norm = normalize_text(user_message)
     best, best_score = None, 0.0
-    for item in KNOWLEDGE_BASE:
+    for item in knowledge_base:
         fields = _lang_fields(item, lang)
         if fields is None:
             continue
@@ -1105,20 +1229,26 @@ def search_exact_knowledge(user_message: str, lang: str = "fa"):
     return None, best_score
 
 
-async def search_hybrid_knowledge(user_message: str, top_k: int = 10, lang: str = "fa") -> list:
+async def search_hybrid_knowledge(
+    user_message: str,
+    knowledge_base: list,
+    index,
+    en_indices: list | None,
+    top_k: int = 10,
+    lang: str = "fa",
+) -> list:
     """
     FAISS + keyword + fuzzy.
     embed_text_async یک‌بار await می‌شود — بقیه CPU-bound.
     ترتیب: اول embed (I/O)، بعد FAISS search (CPU).
-    lang="en": از faiss_index_en (فقط آیتم‌های دارای ترجمه) و فیلدهای انگلیسی
-    استفاده می‌شود؛ آیتم‌های بدون ترجمه اصلاً وارد نتایج نمی‌شوند.
+    knowledge_base/index/en_indices همگی مربوط به یک event خاص هستند (صریحاً
+    پاس داده می‌شوند، نه global — همان دلیل search_exact_knowledge).
+    lang="en": از index انگلیسی همان event (فقط آیتم‌های دارای ترجمه) و
+    فیلدهای انگلیسی استفاده می‌شود؛ آیتم‌های بدون ترجمه اصلاً وارد نتایج نمی‌شوند.
     """
-    index = faiss_index_en if lang == "en" else faiss_index
-    en_indices = KB_EN_INDICES if lang == "en" else None
-
     if index is None or index.ntotal == 0:
         scored = []
-        for item in KNOWLEDGE_BASE:
+        for item in knowledge_base:
             fields = _lang_fields(item, lang)
             if fields is None:
                 continue
@@ -1142,9 +1272,9 @@ async def search_hybrid_knowledge(user_message: str, top_k: int = 10, lang: str 
         if idx == -1:
             continue
         kb_idx = en_indices[idx] if en_indices is not None else idx
-        if kb_idx >= len(KNOWLEDGE_BASE):
+        if kb_idx >= len(knowledge_base):
             continue
-        item = KNOWLEDGE_BASE[kb_idx]
+        item = knowledge_base[kb_idx]
         fields = _lang_fields(item, lang)
         if fields is None:
             continue
@@ -1252,10 +1382,11 @@ async def select_best_candidate(user_message: str, candidates: list, lang: str =
 @app.post("/chat")
 async def chat(req: ChatRequest):
     user_message = req.message.strip()
+    event_id = req.event_id
     if not user_message:
-        return {"answer": get_fallback_message(req.lang), "source": "empty"}
+        return {"answer": get_fallback_message(event_id, req.lang), "source": "empty"}
 
-    # ── بررسی سوالات meta درباره تاریخچه ──
+    # ── بررسی سوالات meta درباره تاریخچه (مستقل از event، فقط از history استفاده می‌کند) ──
     meta_keywords = ["سوال قبلی", "قبلاً چی گفتم", "قبلا چی گفتم", "آخرین سوالم",
                      "چی پرسیدم", "چی گفتم", "سوالم چی بود", "قبلی چی بود"]
     msg_norm_meta = normalize_text(user_message)
@@ -1266,33 +1397,45 @@ async def chat(req: ChatRequest):
             ans = f"آخرین سوال شما این بود: «{last_q}»"
         else:
             ans = "تاریخچه‌ای از سوالات شما وجود ندارد."
-        await log_chat_interaction(user_message, ans, "meta", 1.0)
+        await log_chat_interaction(user_message, ans, "meta", 1.0, event_id=event_id)
         return {"answer": ans, "source": "meta"}
 
     # ۱. Query Enricher (sync — CPU)
     search_query = contextualize_question(user_message, req.history)
 
-    # ۲. Example search (sync — CPU)
+    # ۲. Example search (sync — CPU، مستقل از event، از prompt_config می‌آید)
     example_answer, _ = search_examples(search_query)
     if example_answer:
-        await log_chat_interaction(user_message, example_answer, "example", 1.0, search_query)
+        await log_chat_interaction(user_message, example_answer, "example", 1.0, search_query, event_id=event_id)
         return {"answer": example_answer, "source": "example"}
 
+    # ── این event هنوز هیچ KB‌ای ندارد (هرگز rebuild نشده یا واقعاً خالی است) ──
+    # مستقیم به fallback همان event برو — نه خطا، نه fallthrough به event دیگر.
+    knowledge_base = KNOWLEDGE_BASE.get(event_id)
+    if not knowledge_base:
+        fallback = get_fallback_message(event_id, req.lang)
+        await log_chat_interaction(user_message, fallback, "fallback_no_kb", 0.0, event_id=event_id)
+        return {"answer": fallback, "source": "fallback_no_kb"}
+
     # ۳. Exact / fuzzy search (sync — CPU)
-    exact_item, exact_score = search_exact_knowledge(search_query, lang=req.lang)
+    exact_item, exact_score = search_exact_knowledge(search_query, knowledge_base, lang=req.lang)
     if exact_item:
         ans = _answer_for_lang(exact_item, req.lang)
         if exact_item.get("is_directory"):
             ans = format_directory_response(user_message, ans, lang=req.lang)
         matched_q = exact_item.get("question_en") if req.lang == "en" else exact_item["question"]
-        await log_chat_interaction(user_message, ans, "exact", exact_score, matched_q)
+        await log_chat_interaction(user_message, ans, "exact", exact_score, matched_q, event_id=event_id)
         return {"answer": ans, "source": "exact"}
 
     # ۴. FAISS + hybrid (async — شامل embed I/O)
-    candidates = await search_hybrid_knowledge(search_query, top_k=10, lang=req.lang)
+    index = faiss_index_en.get(event_id) if req.lang == "en" else faiss_index.get(event_id)
+    en_indices = KB_EN_INDICES.get(event_id) if req.lang == "en" else None
+    candidates = await search_hybrid_knowledge(
+        search_query, knowledge_base, index, en_indices, top_k=10, lang=req.lang
+    )
     if not candidates:
-        fallback = get_fallback_message(req.lang)
-        await log_chat_interaction(user_message, fallback, "fallback", 0.0)
+        fallback = get_fallback_message(event_id, req.lang)
+        await log_chat_interaction(user_message, fallback, "fallback", 0.0, event_id=event_id)
         return {"answer": fallback, "source": "fallback"}
 
     print(f"📊 scores: {[round(c['score'],3) for c in candidates]}", flush=True)
@@ -1301,15 +1444,15 @@ async def chat(req: ChatRequest):
     MIN_SCORE  = 0.50
     candidates = [c for c in candidates if c["score"] >= MIN_SCORE]
     if not candidates:
-        fallback = get_fallback_message(req.lang)
-        await log_chat_interaction(user_message, fallback, "fallback_threshold", 0.0)
+        fallback = get_fallback_message(event_id, req.lang)
+        await log_chat_interaction(user_message, fallback, "fallback_threshold", 0.0, event_id=event_id)
         return {"answer": fallback, "source": "fallback"}
 
     # ۶. Ollama انتخاب (async — I/O)
     selected = await select_best_candidate(search_query, candidates[:5], lang=req.lang)
     if not selected:
-        fallback = get_fallback_message(req.lang)
-        await log_chat_interaction(user_message, fallback, "fallback", 0.0)
+        fallback = get_fallback_message(event_id, req.lang)
+        await log_chat_interaction(user_message, fallback, "fallback", 0.0, event_id=event_id)
         return {"answer": fallback, "source": "fallback"}
 
     # ۷. فرمت و برگشت
@@ -1318,7 +1461,7 @@ async def chat(req: ChatRequest):
         ans = format_directory_response(user_message, ans, lang=req.lang)
 
     matched_q = selected["knowledge"].get("question_en") if req.lang == "en" else selected["knowledge"]["question"]
-    await log_chat_interaction(user_message, ans, "rag", selected["score"], matched_q)
+    await log_chat_interaction(user_message, ans, "rag", selected["score"], matched_q, event_id=event_id)
     return {"answer": ans, "source": "rag"}
 
 
@@ -1326,7 +1469,7 @@ async def chat(req: ChatRequest):
 #  endpoint لاگ — برای پنل مدیریت
 # ═══════════════════════════════════════════════
 @app.get("/logs")
-async def get_logs(source: str = None, limit: int = 500):
+async def get_logs(source: str = None, event_id: int = None, limit: int = 500, _: None = Depends(verify_admin_key)):
     logs = []
     if not LOG_FILE_PATH.exists():
         return {"logs": []}
@@ -1336,6 +1479,11 @@ async def get_logs(source: str = None, limit: int = 500):
             for row in reader:
                 if source and row.get("Source", "").lower() != source.lower():
                     continue
+                # لاگ‌های قدیمی‌تر از این migration ستون Event_Id ندارند — event_id=None
+                # برایشان می‌ماند و فیلتر event_id روی آن‌ها اعمال نمی‌شود (تا گم نشوند).
+                row_event_id = row.get("Event_Id") or None
+                if event_id is not None and row_event_id is not None and str(row_event_id) != str(event_id):
+                    continue
                 logs.append({
                     "timestamp":       row.get("Timestamp", ""),
                     "user_message":    row.get("User_Message", ""),
@@ -1343,6 +1491,7 @@ async def get_logs(source: str = None, limit: int = 500):
                     "source":          row.get("Source", ""),
                     "score":           row.get("Score", "0"),
                     "matched_question": row.get("Matched_Question", ""),
+                    "event_id":        row_event_id,
                 })
     except Exception as e:
         return {"logs": [], "error": str(e)}
@@ -1371,14 +1520,15 @@ def _generate_faq_id(existing_ids: set) -> str:
 
 
 @app.get("/admin/faq")
-async def admin_list_faq(_: None = Depends(verify_admin_key)):
+async def admin_list_faq(event_id: int = Query(...), _: None = Depends(verify_admin_key)):
     conn = None
     try:
         conn = get_faq_db_connection()
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, category, question, answer, question_en, answer_en, synced_to_primary "
-                "FROM faq ORDER BY created_at"
+                "FROM faq WHERE event_id = %s ORDER BY created_at",
+                (event_id,),
             )
             rows = cur.fetchall()
     except Exception as e:
@@ -1391,7 +1541,7 @@ async def admin_list_faq(_: None = Depends(verify_admin_key)):
 
 
 @app.post("/admin/faq")
-async def admin_create_faq(payload: FAQCreate, _: None = Depends(verify_admin_key)):
+async def admin_create_faq(payload: FAQCreate, event_id: int = Query(...), _: None = Depends(verify_admin_key)):
     conn = None
     try:
         conn = get_faq_db_connection()
@@ -1404,12 +1554,12 @@ async def admin_create_faq(payload: FAQCreate, _: None = Depends(verify_admin_ke
                 new_id = _generate_faq_id(existing_ids)
             cur.execute(
                 """
-                INSERT INTO faq (id, category, question, answer, question_en, answer_en, synced_to_primary)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO faq (id, category, question, answer, question_en, answer_en, synced_to_primary, event_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id, category, question, answer, question_en, answer_en, synced_to_primary
                 """,
                 (new_id, payload.category, payload.question, payload.answer,
-                 payload.question_en, payload.answer_en, payload.synced_to_primary),
+                 payload.question_en, payload.answer_en, payload.synced_to_primary, event_id),
             )
             row = cur.fetchone()
         conn.commit()
@@ -1421,25 +1571,29 @@ async def admin_create_faq(payload: FAQCreate, _: None = Depends(verify_admin_ke
         if conn:
             conn.close()
 
-    await rebuild_knowledge_base()
+    await rebuild_knowledge_base(event_id)
     return _faq_row_to_dict(row)
 
 
 @app.put("/admin/faq/{faq_id}")
-async def admin_update_faq(faq_id: str, payload: FAQUpdate, _: None = Depends(verify_admin_key)):
+async def admin_update_faq(faq_id: str, payload: FAQUpdate, event_id: int = Query(...), _: None = Depends(verify_admin_key)):
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
 
     set_clauses = [f"{field} = %s" for field in updates] + ["updated_at = NOW()"]
-    values = list(updates.values()) + [faq_id]
+    # event_id در WHERE به‌عنوان یک guard دفاعی اضافه شده — id‌های FAQ به‌صورت
+    # سراسری یکتا هستند (رشته‌ی تصادفی ۸ کاراکتری)، پس این فقط از یک ادمین با
+    # event فعلی متفاوت جلوگیری می‌کند که با یک id شناخته‌شده/leak-شده ردیف
+    # event دیگری را ویرایش کند — نه یک نیاز فنی برای پیدا کردن ردیف.
+    values = list(updates.values()) + [faq_id, event_id]
 
     conn = None
     try:
         conn = get_faq_db_connection()
         with conn.cursor() as cur:
             cur.execute(
-                f"UPDATE faq SET {', '.join(set_clauses)} WHERE id = %s "
+                f"UPDATE faq SET {', '.join(set_clauses)} WHERE id = %s AND event_id = %s "
                 f"RETURNING id, category, question, answer, question_en, answer_en, synced_to_primary",
                 values,
             )
@@ -1458,17 +1612,17 @@ async def admin_update_faq(faq_id: str, payload: FAQUpdate, _: None = Depends(ve
         if conn:
             conn.close()
 
-    await rebuild_knowledge_base()
+    await rebuild_knowledge_base(event_id)
     return _faq_row_to_dict(row)
 
 
 @app.delete("/admin/faq/{faq_id}")
-async def admin_delete_faq(faq_id: str, _: None = Depends(verify_admin_key)):
+async def admin_delete_faq(faq_id: str, event_id: int = Query(...), _: None = Depends(verify_admin_key)):
     conn = None
     try:
         conn = get_faq_db_connection()
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM faq WHERE id = %s", (faq_id,))
+            cur.execute("DELETE FROM faq WHERE id = %s AND event_id = %s", (faq_id, event_id))
             deleted = cur.rowcount
         if deleted == 0:
             conn.rollback()
@@ -1484,7 +1638,7 @@ async def admin_delete_faq(faq_id: str, _: None = Depends(verify_admin_key)):
         if conn:
             conn.close()
 
-    await rebuild_knowledge_base()
+    await rebuild_knowledge_base(event_id)
     return {"deleted": True}
 
 
@@ -1495,12 +1649,12 @@ async def admin_delete_faq(faq_id: str, _: None = Depends(verify_admin_key)):
 #  /chat اعمال می‌شود.
 # ═══════════════════════════════════════════════
 @app.get("/admin/bot-settings")
-async def admin_get_bot_settings(_: None = Depends(verify_admin_key)):
-    return BOT_SETTINGS
+async def admin_get_bot_settings(event_id: int = Query(...), _: None = Depends(verify_admin_key)):
+    return BOT_SETTINGS.get(event_id, {})
 
 
 @app.put("/admin/bot-settings/{key}")
-async def admin_update_bot_setting(key: str, payload: BotSettingUpdate, _: None = Depends(verify_admin_key)):
+async def admin_update_bot_setting(key: str, payload: BotSettingUpdate, event_id: int = Query(...), _: None = Depends(verify_admin_key)):
     global BOT_SETTINGS
 
     if payload.value_fa is None and payload.value_en is None:
@@ -1514,14 +1668,14 @@ async def admin_update_bot_setting(key: str, payload: BotSettingUpdate, _: None 
             # مقدار قبلی همان ستون در صورت conflict (partial update روی upsert).
             cur.execute(
                 """
-                INSERT INTO bot_settings (key, value_fa, value_en, updated_at)
-                VALUES (%s, %s, %s, NOW())
-                ON CONFLICT (key) DO UPDATE SET
+                INSERT INTO bot_settings (event_id, key, value_fa, value_en, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (event_id, key) DO UPDATE SET
                     value_fa   = COALESCE(EXCLUDED.value_fa, bot_settings.value_fa),
                     value_en   = COALESCE(EXCLUDED.value_en, bot_settings.value_en),
                     updated_at = NOW()
                 """,
-                (key, payload.value_fa, payload.value_en),
+                (event_id, key, payload.value_fa, payload.value_en),
             )
         conn.commit()
     except Exception as e:
@@ -1533,7 +1687,7 @@ async def admin_update_bot_setting(key: str, payload: BotSettingUpdate, _: None 
             conn.close()
 
     BOT_SETTINGS = load_bot_settings()
-    return BOT_SETTINGS
+    return BOT_SETTINGS.get(event_id, {})
 
 
 # ═══════════════════════════════════════════════
@@ -1551,23 +1705,27 @@ COMPANY_FIELDS = [
 COMPANY_JSON_FIELDS = {"logo", "phones", "emails"}
 COMPANY_BOOLEAN_FIELDS = {"is_sponsor", "is_manual", "repeatable_scan"}  # DEFAULT false در schema
 
-_COMPANY_ALL_COLUMNS = COMPANY_FIELDS + ["event_id"]
+# rasayesh_event_id (شرکت‌ها به کدام رویداد Rasayesh تعلق دارند) جدا از local
+# event_id (کدام رویداد محلی — IranPharma=1، Iran Cosmetica=2 و ...) — دو
+# مفهوم متفاوت که قبلاً هر دو "event_id" نامیده می‌شدند (سردرگمی که در این
+# migration رفع شد، مشابه Phase 1 اپ اصلی).
+_COMPANY_ALL_COLUMNS = COMPANY_FIELDS + ["rasayesh_event_id", "event_id"]
 _COMPANY_INSERT_SQL = (
     f"INSERT INTO companies ({', '.join(_COMPANY_ALL_COLUMNS)}) "
     f"VALUES ({', '.join(['%s'] * len(_COMPANY_ALL_COLUMNS))}) "
     f"ON CONFLICT (id) DO UPDATE SET "
     + ", ".join(f"{col} = EXCLUDED.{col}" for col in COMPANY_FIELDS if col != "id")
-    + ", event_id = EXCLUDED.event_id, synced_at = NOW()"
+    + ", rasayesh_event_id = EXCLUDED.rasayesh_event_id, event_id = EXCLUDED.event_id, synced_at = NOW()"
 )
 
 
 @app.get("/admin/companies")
-async def admin_list_companies(_: None = Depends(verify_admin_key)):
+async def admin_list_companies(event_id: int = Query(...), _: None = Depends(verify_admin_key)):
     conn = None
     try:
         conn = get_faq_db_connection()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM companies ORDER BY brand_name_fa")
+            cur.execute("SELECT * FROM companies WHERE event_id = %s ORDER BY brand_name_fa", (event_id,))
             rows = cur.fetchall()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
@@ -1580,11 +1738,18 @@ async def admin_list_companies(_: None = Depends(verify_admin_key)):
 
 @app.post("/admin/companies/sync")
 async def admin_sync_companies(payload: dict = Body(...), _: None = Depends(verify_admin_key)):
+    # event_id: local event id این چت‌بات (iph-apn هر بار صریحاً می‌فرستد).
+    # rasayesh_event_id: id همان رویداد در سیستم خارجی Rasayesh — برای نمایش/
+    # ردیابی نگه داشته می‌شود، در تشخیص "این شرکت مال کدام local event است"
+    # نقشی ندارد.
     event_id = payload.get("event_id")
+    rasayesh_event_id = payload.get("rasayesh_event_id")
     companies = payload.get("companies")
 
     if not isinstance(event_id, int) or isinstance(event_id, bool):
         raise HTTPException(status_code=400, detail="'event_id' must be an integer")
+    if not isinstance(rasayesh_event_id, int) or isinstance(rasayesh_event_id, bool):
+        raise HTTPException(status_code=400, detail="'rasayesh_event_id' must be an integer")
     if not isinstance(companies, list):
         raise HTTPException(status_code=400, detail="'companies' must be a list")
     for i, c in enumerate(companies):
@@ -1595,7 +1760,10 @@ async def admin_sync_companies(payload: dict = Body(...), _: None = Depends(veri
     try:
         conn = get_faq_db_connection()
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM companies WHERE event_id != %s", (event_id,))
+            # فقط شرکت‌های همین local event پاک/جایگزین می‌شوند — sync یک event
+            # هرگز شرکت‌های eventهای دیگر را حذف نمی‌کند (قبلاً با != کل جدول
+            # به‌عنوان single-tenant پاک می‌شد، که با چند event نادرست است).
+            cur.execute("DELETE FROM companies WHERE event_id = %s", (event_id,))
             for c in companies:
                 values = []
                 for field in COMPANY_FIELDS:
@@ -1605,6 +1773,7 @@ async def admin_sync_companies(payload: dict = Body(...), _: None = Depends(veri
                     elif field in COMPANY_BOOLEAN_FIELDS and value is None:
                         value = False
                     values.append(value)
+                values.append(rasayesh_event_id)
                 values.append(event_id)
                 cur.execute(_COMPANY_INSERT_SQL, values)
         conn.commit()
@@ -1618,5 +1787,5 @@ async def admin_sync_companies(payload: dict = Body(...), _: None = Depends(veri
         if conn:
             conn.close()
 
-    await rebuild_knowledge_base()
-    return {"synced": len(companies), "event_id": event_id}
+    await rebuild_knowledge_base(event_id)
+    return {"synced": len(companies), "event_id": event_id, "rasayesh_event_id": rasayesh_event_id}

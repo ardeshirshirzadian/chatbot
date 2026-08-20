@@ -16,7 +16,8 @@ DB_CONFIG = {
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS companies (
     id INTEGER PRIMARY KEY,
-    event_id INTEGER,
+    rasayesh_event_id INTEGER,
+    event_id INTEGER NOT NULL DEFAULT 1,
     brand_name_fa TEXT,
     brand_name_en TEXT,
     legal_name_fa TEXT,

@@ -8,9 +8,17 @@ DST = {"host": "127.0.0.1", "port": 5434, "user": "chatbot", "password": "Xk7#mQ
 src_conn = psycopg2.connect(**SRC)
 dst_conn = psycopg2.connect(**DST)
 
+# NOTE (Phase 4 fix): the main app's own companies.event_id was ALSO renamed
+# in its Phase 1 (same rasayesh-id-vs-local-id disambiguation this chatbot DB
+# just went through) — it's now the LOCAL event id there, and the Rasayesh id
+# moved to companies.rasayesh_event_id. This script used to select just
+# `event_id` and copy it verbatim into the chatbot DB's `companies.event_id`,
+# which — before this fix — meant the Rasayesh id. Running the old version
+# today would have silently dropped the Rasayesh linkage and mislabeled the
+# column. Now both ids are selected/copied into their correctly-named columns.
 src_cur = src_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 src_cur.execute("""
-    SELECT id, event_id, brand_name_fa, brand_name_en, legal_name_fa, legal_name_en,
+    SELECT id, rasayesh_event_id, event_id, brand_name_fa, brand_name_en, legal_name_fa, legal_name_en,
            logo, website, description_fa, description_en, slug, phones, emails,
            address_fa, address_en, industry_id, hall_name, booth_no, is_sponsor,
            sponsor_level, booth_uuid, booth_xp, is_manual, linked_mission_id,
@@ -30,20 +38,21 @@ for r in rows:
 
     dst_cur.execute("""
         INSERT INTO companies (
-            id, event_id, brand_name_fa, brand_name_en, legal_name_fa, legal_name_en,
+            id, rasayesh_event_id, event_id, brand_name_fa, brand_name_en, legal_name_fa, legal_name_en,
             logo, website, description_fa, description_en, slug, phones, emails,
             address_fa, address_en, industry_id, hall_name, booth_no, is_sponsor,
             sponsor_level, booth_uuid, booth_xp, is_manual, linked_mission_id,
             linked_badge_id, repeatable_scan, repeatable_scan_hours, repeatable_start_hour
         ) VALUES (
-            %(id)s, %(event_id)s, %(brand_name_fa)s, %(brand_name_en)s, %(legal_name_fa)s, %(legal_name_en)s,
+            %(id)s, %(rasayesh_event_id)s, %(event_id)s, %(brand_name_fa)s, %(brand_name_en)s, %(legal_name_fa)s, %(legal_name_en)s,
             %(logo)s, %(website)s, %(description_fa)s, %(description_en)s, %(slug)s, %(phones)s, %(emails)s,
             %(address_fa)s, %(address_en)s, %(industry_id)s, %(hall_name)s, %(booth_no)s, %(is_sponsor)s,
             %(sponsor_level)s, %(booth_uuid)s, %(booth_xp)s, %(is_manual)s, %(linked_mission_id)s,
             %(linked_badge_id)s, %(repeatable_scan)s, %(repeatable_scan_hours)s, %(repeatable_start_hour)s
         )
         ON CONFLICT (id) DO UPDATE SET
-            event_id=EXCLUDED.event_id, brand_name_fa=EXCLUDED.brand_name_fa, brand_name_en=EXCLUDED.brand_name_en,
+            rasayesh_event_id=EXCLUDED.rasayesh_event_id, event_id=EXCLUDED.event_id,
+            brand_name_fa=EXCLUDED.brand_name_fa, brand_name_en=EXCLUDED.brand_name_en,
             legal_name_fa=EXCLUDED.legal_name_fa, legal_name_en=EXCLUDED.legal_name_en, logo=EXCLUDED.logo,
             website=EXCLUDED.website, description_fa=EXCLUDED.description_fa, description_en=EXCLUDED.description_en,
             slug=EXCLUDED.slug, phones=EXCLUDED.phones, emails=EXCLUDED.emails, address_fa=EXCLUDED.address_fa,
