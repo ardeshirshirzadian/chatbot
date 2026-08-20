@@ -12,17 +12,19 @@ DB_CONFIG = {
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS bot_settings (
-    key TEXT PRIMARY KEY,
+    event_id INTEGER NOT NULL DEFAULT 1,
+    key TEXT NOT NULL,
     value_fa TEXT,
     value_en TEXT,
-    updated_at TIMESTAMP DEFAULT NOW()
+    updated_at TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (event_id, key)
 );
 """
 
 SEED_FALLBACK_SQL = """
-INSERT INTO bot_settings (key, value_fa, value_en)
-VALUES (%s, %s, %s)
-ON CONFLICT (key) DO NOTHING;
+INSERT INTO bot_settings (event_id, key, value_fa, value_en)
+VALUES (%s, %s, %s, %s)
+ON CONFLICT (event_id, key) DO NOTHING;
 """
 
 FALLBACK_FA = "این سؤال خارج از حوزه نمایشگاه ایران‌فارما است یا اطلاعات آن در پایگاه دانش ثبت نشده است."
@@ -34,7 +36,7 @@ def main():
         with conn:
             with conn.cursor() as cur:
                 cur.execute(CREATE_TABLE_SQL)
-                cur.execute(SEED_FALLBACK_SQL, ("fallback_message", FALLBACK_FA, FALLBACK_EN))
+                cur.execute(SEED_FALLBACK_SQL, (1, "fallback_message", FALLBACK_FA, FALLBACK_EN))
         print("✅ Table `bot_settings` created (or already existed).")
         print("✅ Seed row `fallback_message` inserted (or already existed).")
     finally:

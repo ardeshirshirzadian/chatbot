@@ -77,11 +77,11 @@ def main():
                     new_id = generate_id(existing_ids)
                     cur.execute(
                         """
-                        INSERT INTO faq (id, category, question, answer)
-                        VALUES (%s, %s, %s, %s)
+                        INSERT INTO faq (id, category, question, answer, event_id)
+                        VALUES (%s, %s, %s, %s, %s)
                         ON CONFLICT (id) DO NOTHING
                         """,
-                        (new_id, row["category"], row["question"], row["answer"]),
+                        (new_id, row["category"], row["question"], row["answer"], 1),
                     )
                     if cur.rowcount == 1:
                         inserted += 1
