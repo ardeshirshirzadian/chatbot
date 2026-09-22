@@ -514,6 +514,143 @@ def load_companies_from_postgres(event_id: int | None = None):
     return company_items
 
 
+def _format_panel_time(starts_at, ends_at) -> str:
+    """starts_at/ends_at از Postgres به‌صورت naive datetime می‌آیند — همان
+    مقداری که بقیه‌ی اپ (مثل صفحه‌ی عمومی پنل‌ها) بدون تبدیل timezone نمایش
+    می‌دهد؛ اینجا هم بدون تبدیل فرمت می‌شوند، فقط برای خوانایی."""
+    if not starts_at:
+        return ""
+    try:
+        date_str = starts_at.strftime("%Y-%m-%d")
+        start_str = starts_at.strftime("%H:%M")
+        if ends_at:
+            return f"{date_str} ساعت {start_str} تا {ends_at.strftime('%H:%M')}"
+        return f"{date_str} ساعت {start_str}"
+    except Exception:
+        return ""
+
+
+def load_panels_from_postgres(event_id: int | None = None):
+    """
+    آیتم‌های پنل/کارگاه از جدول Postgres `panels` — جایگزین knowledge_list
+    قدیمی مشابه companies، اما بدون is_directory: پاسخ‌ها همان‌جا در ingestion
+    به‌صورت متن آماده ساخته می‌شوند (نه JSON نیازمند فرمت‌دهی جدا مثل
+    format_directory_response شرکت‌ها) چون شکل سوال‌های پنل/کارگاه یکنواخت‌تر
+    است. kind (PANEL/WORKSHOP، هرچند این ستون در دیتای منبع بین حروف بزرگ و
+    کوچک ناسازگار است) فقط برای انتخاب دسته‌بندی/برچسب استفاده می‌شود — یک
+    نوع آیتم KB جدا نیست.
+    """
+    panel_items = []
+    try:
+        conn = get_faq_db_connection()
+        try:
+            with conn.cursor() as cur:
+                base_query = (
+                    "SELECT id, title_fa, title_en, description_fa, description_en, "
+                    "hall_fa, hall_en, starts_at, ends_at, kind, speakers, event_id "
+                    "FROM panels"
+                )
+                if event_id is not None:
+                    cur.execute(base_query + " WHERE event_id = %s", (event_id,))
+                else:
+                    cur.execute(base_query)
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"Error loading panels from Postgres: {e}", flush=True)
+        return panel_items
+
+    for (row_id, title_fa, title_en, description_fa, description_en,
+         hall_fa, hall_en, starts_at, ends_at, kind, speakers, row_event_id) in rows:
+        title = (title_fa or "").strip()
+        if not title:
+            continue
+
+        is_workshop = (kind or "").strip().upper() == "WORKSHOP"
+        category = "کارگاه‌های آموزشی نمایشگاه" if is_workshop else "پنل‌های نمایشگاه"
+        kind_label = "کارگاه" if is_workshop else "پنل"
+        time_str = _format_panel_time(starts_at, ends_at)
+
+        question = (
+            f"{kind_label} {title} چه زمانی برگزار می‌شود؟ "
+            f"{title} کجاست؟ در چه سالنی برگزار می‌شود؟ "
+            f"سخنرانان {title} چه کسانی هستند؟ "
+            f"درباره {kind_label} {title} توضیح بده"
+        )
+
+        speakers_fa = []
+        for sp in (speakers or []):
+            name = f"{(sp.get('firstname_fa') or '').strip()} {(sp.get('lastname_fa') or '').strip()}".strip()
+            if not name:
+                continue
+            job = (sp.get('job_title_fa') or '').strip()
+            speakers_fa.append(f"{name} ({job})" if job else name)
+
+        answer_parts = [f"🎤 {kind_label}: {title}"]
+        if time_str:
+            answer_parts.append(f"🕒 زمان: {time_str}")
+        if hall_fa:
+            answer_parts.append(f"📍 سالن: {hall_fa}")
+        if speakers_fa:
+            answer_parts.append(f"🎙️ سخنران(ها): {', '.join(speakers_fa)}")
+        description_fa_s = (description_fa or "").strip()
+        if description_fa_s:
+            answer_parts.append(f"\n{description_fa_s}")
+        answer = "\n".join(answer_parts)
+
+        # ── نسخه انگلیسی (اختیاری) — فقط اگر title_en موجود باشد، همان الگوی companies
+        title_en_s = (title_en or "").strip()
+        question_en = answer_en = question_en_norm = search_text_en = None
+        if title_en_s:
+            kind_label_en = "Workshop" if is_workshop else "Panel"
+            question_en = (
+                f"When is the {kind_label_en.lower()} {title_en_s}? "
+                f"Where is {title_en_s}? Which hall is it in? "
+                f"Who are the speakers at {title_en_s}? "
+                f"Tell me about {title_en_s}"
+            )
+
+            speakers_en = []
+            for sp in (speakers or []):
+                name_en = f"{(sp.get('firstname_en') or '').strip()} {(sp.get('lastname_en') or '').strip()}".strip()
+                if name_en:
+                    speakers_en.append(name_en)
+
+            answer_parts_en = [f"🎤 {kind_label_en}: {title_en_s}"]
+            if time_str:
+                answer_parts_en.append(f"🕒 Time: {time_str}")
+            if hall_en:
+                answer_parts_en.append(f"📍 Hall: {hall_en}")
+            if speakers_en:
+                answer_parts_en.append(f"🎙️ Speaker(s): {', '.join(speakers_en)}")
+            description_en_s = (description_en or "").strip()
+            if description_en_s:
+                answer_parts_en.append(f"\n{description_en_s}")
+            answer_en = "\n".join(answer_parts_en)
+
+            question_en_norm = normalize_text(question_en)
+            search_text_en = build_search_text(question_en, answer_en, category, "postgres:panels")
+
+        panel_items.append({
+            "id": f"panel_{row_id}",
+            "event_id": row_event_id,
+            "category": category,
+            "question": question,
+            "question_norm": normalize_text(question),
+            "answer": answer,
+            "search_text": build_search_text(question, answer, category, "postgres:panels"),
+            "source_file": "postgres:panels",
+            "is_directory": False,
+            "question_en": question_en,
+            "answer_en": answer_en,
+            "question_en_norm": question_en_norm,
+            "search_text_en": search_text_en,
+        })
+
+    return panel_items
+
+
 def load_all_knowledge_bases(event_id: int | None = None) -> dict:
     """
     خروجی: {event_id: [item, ...]} — یک KB جدا به‌ازای هر local event_id.
@@ -526,6 +663,7 @@ def load_all_knowledge_bases(event_id: int | None = None) -> dict:
     """
     knowledge_list = load_faq_from_postgres(event_id)
     knowledge_list.extend(load_companies_from_postgres(event_id))
+    knowledge_list.extend(load_panels_from_postgres(event_id))
 
     csv_items = []
     if KNOWLEDGE_DIR.exists() and (event_id is None or event_id == 1):
@@ -1789,3 +1927,91 @@ async def admin_sync_companies(payload: dict = Body(...), _: None = Depends(veri
 
     await rebuild_knowledge_base(event_id)
     return {"synced": len(companies), "event_id": event_id, "rasayesh_event_id": rasayesh_event_id}
+
+
+# ═══════════════════════════════════════════════
+#  Admin — پنل‌ها/کارگاه‌ها (panels)
+#  همان محافظت X-Admin-Key؛ بعد از هر sync، KNOWLEDGE_BASE/FAISS خودکار rebuild می‌شود.
+#  kind (PANEL/WORKSHOP) فقط یک ستون محتوایی است، نه یک منبع جدا.
+# ═══════════════════════════════════════════════
+PANEL_FIELDS = [
+    "id", "title_fa", "title_en", "description_fa", "description_en",
+    "hall_fa", "hall_en", "starts_at", "ends_at", "capacity", "kind",
+    "thumbnail", "speakers",
+]
+PANEL_JSON_FIELDS = {"thumbnail", "speakers"}
+
+_PANEL_ALL_COLUMNS = PANEL_FIELDS + ["rasayesh_event_id", "event_id"]
+_PANEL_INSERT_SQL = (
+    f"INSERT INTO panels ({', '.join(_PANEL_ALL_COLUMNS)}) "
+    f"VALUES ({', '.join(['%s'] * len(_PANEL_ALL_COLUMNS))}) "
+    f"ON CONFLICT (id) DO UPDATE SET "
+    + ", ".join(f"{col} = EXCLUDED.{col}" for col in PANEL_FIELDS if col != "id")
+    + ", rasayesh_event_id = EXCLUDED.rasayesh_event_id, event_id = EXCLUDED.event_id, synced_at = NOW()"
+)
+
+
+@app.get("/admin/panels")
+async def admin_list_panels(event_id: int = Query(...), _: None = Depends(verify_admin_key)):
+    conn = None
+    try:
+        conn = get_faq_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM panels WHERE event_id = %s ORDER BY starts_at NULLS LAST", (event_id,))
+            rows = cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    return [dict(r) for r in rows]
+
+
+@app.post("/admin/panels/sync")
+async def admin_sync_panels(payload: dict = Body(...), _: None = Depends(verify_admin_key)):
+    # همان قرارداد companies: event_id لوکال این چت‌بات، rasayesh_event_id
+    # فقط برای نمایش/ردیابی.
+    event_id = payload.get("event_id")
+    rasayesh_event_id = payload.get("rasayesh_event_id")
+    panels = payload.get("panels")
+
+    if not isinstance(event_id, int) or isinstance(event_id, bool):
+        raise HTTPException(status_code=400, detail="'event_id' must be an integer")
+    if not isinstance(rasayesh_event_id, int) or isinstance(rasayesh_event_id, bool):
+        raise HTTPException(status_code=400, detail="'rasayesh_event_id' must be an integer")
+    if not isinstance(panels, list):
+        raise HTTPException(status_code=400, detail="'panels' must be a list")
+    for i, p in enumerate(panels):
+        if not isinstance(p, dict) or "id" not in p:
+            raise HTTPException(status_code=400, detail=f"panels[{i}] must be an object with an 'id' field")
+
+    conn = None
+    try:
+        conn = get_faq_db_connection()
+        with conn.cursor() as cur:
+            # فقط پنل/کارگاه‌های همین local event پاک/جایگزین می‌شوند (مثل companies).
+            cur.execute("DELETE FROM panels WHERE event_id = %s", (event_id,))
+            for p in panels:
+                values = []
+                for field in PANEL_FIELDS:
+                    value = p.get(field)
+                    if field in PANEL_JSON_FIELDS and value is not None:
+                        value = Json(value)
+                    values.append(value)
+                values.append(rasayesh_event_id)
+                values.append(event_id)
+                cur.execute(_PANEL_INSERT_SQL, values)
+        conn.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    await rebuild_knowledge_base(event_id)
+    return {"synced": len(panels), "event_id": event_id, "rasayesh_event_id": rasayesh_event_id}
