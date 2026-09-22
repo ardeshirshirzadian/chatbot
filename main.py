@@ -234,7 +234,7 @@ async def call_ollama_async(messages: list, num_predict: int = 3, temperature: f
                 "stream": False,
                 "options": {"temperature": temperature, "num_predict": num_predict},
             },
-            timeout=30.0,
+            timeout=45.0,
         )
         resp.raise_for_status()
         return resp.json()["message"]["content"].strip()
