@@ -575,6 +575,25 @@ def _format_panel_time(starts_at, ends_at) -> str:
         return ""
 
 
+def _short_title(t: str, max_len: int = 45) -> str:
+    """
+    Selector-display-only title shortener. Panel/workshop titles that
+    combine a short headline with a longer elaboration are consistently
+    authored with a Persian semicolon between the two parts (e.g. "X؛
+    توضیح بیشتر درباره X"). Prefer that natural split; a title with
+    neither a semicolon nor natural brevity falls back to a hard
+    word-boundary character cap. Only feeds question_display/_en -- the
+    real title is untouched everywhere else (question, search_text,
+    answer, and anything shown to the user).
+    """
+    if "؛" in t:
+        t = t.split("؛", 1)[0].strip()
+    if len(t) > max_len:
+        truncated = t[:max_len].rsplit(" ", 1)[0]
+        t = (truncated or t[:max_len]) + "…"
+    return t
+
+
 def load_panels_from_postgres(event_id: int | None = None):
     """
     آیتم‌های پنل/کارگاه از جدول Postgres `panels` — جایگزین knowledge_list
@@ -623,6 +642,15 @@ def load_panels_from_postgres(event_id: int | None = None):
             f"سخنرانان {title} چه کسانی هستند؟ "
             f"درباره {kind_label} {title} توضیح بده"
         )
+        # Selector-facing display text: one clean sentence, not the four-part
+        # run-on question above, and with long semicolon-clause titles
+        # shortened. select_best_candidate()'s LLM judge is asked whether an
+        # option "DIRECTLY and SPECIFICALLY" answers the user's question; a
+        # multi-question blob -- or a very long title -- reads as ambiguous
+        # to it and gets rejected even when it's the correct top FAISS
+        # match. `question` and `search_text` (the rich blob, real title)
+        # still drive embedding/exact-match, unchanged.
+        question_display = f"{kind_label} {_short_title(title)} چه زمانی و در کجا برگزار می‌شود؟"
 
         speakers_fa = []
         for sp in (speakers or []):
@@ -646,7 +674,7 @@ def load_panels_from_postgres(event_id: int | None = None):
 
         # ── نسخه انگلیسی (اختیاری) — فقط اگر title_en موجود باشد، همان الگوی companies
         title_en_s = (title_en or "").strip()
-        question_en = answer_en = question_en_norm = search_text_en = None
+        question_en = answer_en = question_en_norm = search_text_en = question_display_en = None
         if title_en_s:
             kind_label_en = "Workshop" if is_workshop else "Panel"
             question_en = (
@@ -655,6 +683,7 @@ def load_panels_from_postgres(event_id: int | None = None):
                 f"Who are the speakers at {title_en_s}? "
                 f"Tell me about {title_en_s}"
             )
+            question_display_en = f"When and where is the {kind_label_en.lower()} {_short_title(title_en_s)} held?"
 
             speakers_en = []
             for sp in (speakers or []):
@@ -682,12 +711,14 @@ def load_panels_from_postgres(event_id: int | None = None):
             "event_id": row_event_id,
             "category": category,
             "question": question,
+            "question_display": question_display,
             "question_norm": normalize_text(question),
             "answer": answer,
             "search_text": build_search_text(question, answer, category, "postgres:panels"),
             "source_file": "postgres:panels",
             "is_directory": False,
             "question_en": question_en,
+            "question_display_en": question_display_en,
             "answer_en": answer_en,
             "question_en_norm": question_en_norm,
             "search_text_en": search_text_en,
@@ -1551,8 +1582,13 @@ async def select_best_candidate(user_message: str, candidates: list, lang: str =
     if not candidates:
         return None
 
+    def _cand_display_question(item):
+        if lang == "en":
+            return item.get("question_display_en") or item.get("question_en") or item["question"]
+        return item.get("question_display") or item["question"]
+
     options = "".join(
-        f"{i}. {_lang_question(c['knowledge'], lang) or c['knowledge']['question']}\n"
+        f"{i}. {_cand_display_question(c['knowledge'])}\n"
         for i, c in enumerate(candidates, 1)
     )
 
