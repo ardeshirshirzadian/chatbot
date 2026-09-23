@@ -42,6 +42,25 @@ EMBED_MODEL = "bge-m3"
 
 DEFAULT_FALLBACK = "این سؤال خارج از حوزه نمایشگاه ایران‌فارما است یا اطلاعات آن در پایگاه دانش ثبت نشده است."
 
+# ── سقف همزمانی برای بخش‌های وابسته به Ollama (embedding + انتخاب) ──────────
+# این سرویس، fallback روی CPU همین VPS است (نه GPU) و همان ۶ هسته را با
+# کانتینرهای iph-app/iph-apn/Postgres/Redis شریک است. اندازه‌گیری واقعی روز
+# ۲۰۲۶-۰۹-۱۲: دو تولید هم‌زمان روی Ollama (llama-server) به‌تنهایی ~۴.۷ از ۶
+# هسته را اشغال کرد. سقف = ۲ هم‌زمان، تا در صورت قطعی سرور GPU طی نمایشگاه،
+# ترافیک fallback نتواند بقیه‌ی کانتینرهای همین VPS را گرسنه نگه دارد.
+CHAT_CONCURRENCY_LIMIT   = int(os.getenv("CHAT_CONCURRENCY_LIMIT", "2"))
+CHAT_QUEUE_WAIT_SECONDS  = float(os.getenv("CHAT_QUEUE_WAIT_SECONDS", "15"))
+_chat_llm_semaphore = asyncio.Semaphore(CHAT_CONCURRENCY_LIMIT)
+
+# route.js (iph-app) tries the GPU primary for 15s, then this fallback for up
+# to 90s. A 15s queue wait here + a ~30-45s worst-case generation still lands
+# well inside that 90s budget, so a busy reply here never collides with
+# route.js's own timeout.
+CAPACITY_BUSY_MESSAGE = {
+    "fa": "چت‌بات موقتاً شلوغ است، لطفاً کمی بعد امتحان کنید.",
+    "en": "The chatbot is temporarily busy. Please try again in a moment.",
+}
+
 # ── یک httpx.AsyncClient مشترک برای کل اپ ──────────────────────────
 # keep-alive + connection pool — در روزهای نمایشگاه فشار کمتری روی Ollama
 _http: httpx.AsyncClient = None
@@ -264,30 +283,30 @@ async def warmup_ollama_model():
 # ═══════════════════════════════════════════════
 #  لاگ async — بدون race condition
 # ═══════════════════════════════════════════════
-LOG_HEADER = ["Timestamp", "User_Message", "Bot_Answer", "Source", "Score", "Matched_Question", "Event_Id"]
+LOG_HEADER = ["Timestamp", "User_Message", "Bot_Answer", "Source", "Score", "Matched_Question", "Event_Id", "User_Uuid"]
 
 
 def _migrate_log_header_if_stale():
     """
-    اگر chat_logs.csv از قبل با header قدیمی (بدون ستون Event_Id) وجود دارد،
-    فایل قدیمی را کنار می‌گذارد (rename با timestamp) تا نوشتن بعدی یک فایل
-    تازه با header جدید بسازد. فقط یک‌بار لازم است اجرا شود — بعد از اولین
-    self-heal، فایل جدید همیشه header درست را دارد. صدا زدن این تابع باید زیر
-    _log_lock باشد (توسط caller تضمین می‌شود).
+    اگر chat_logs.csv از قبل با header قدیمی (بدون ستون Event_Id یا User_Uuid)
+    وجود دارد، فایل قدیمی را کنار می‌گذارد (rename با timestamp) تا نوشتن بعدی
+    یک فایل تازه با header جدید بسازد. فقط یک‌بار لازم است اجرا شود — بعد از
+    اولین self-heal، فایل جدید همیشه header درست را دارد. صدا زدن این تابع
+    باید زیر _log_lock باشد (توسط caller تضمین می‌شود).
     """
     if not LOG_FILE_PATH.exists():
         return
     try:
         with open(LOG_FILE_PATH, newline="", encoding="utf-8-sig") as f:
             first_line = f.readline()
-        if "Event_Id" not in first_line:
+        if "User_Uuid" not in first_line:
             stamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            LOG_FILE_PATH.rename(LOG_FILE_PATH.with_name(f"{LOG_FILE_PATH.stem}.pre-event-migration-{stamp}.csv"))
+            LOG_FILE_PATH.rename(LOG_FILE_PATH.with_name(f"{LOG_FILE_PATH.stem}.pre-user-uuid-migration-{stamp}.csv"))
     except Exception:
         pass
 
 
-async def log_chat_interaction(user_msg: str, bot_ans: str, source: str, score: float, matched_q: str = "", event_id: int | None = None):
+async def log_chat_interaction(user_msg: str, bot_ans: str, source: str, score: float, matched_q: str = "", event_id: int | None = None, user_uuid: str | None = None):
     async with _log_lock:
         try:
             _migrate_log_header_if_stale()
@@ -299,7 +318,7 @@ async def log_chat_interaction(user_msg: str, bot_ans: str, source: str, score: 
                     writer.writerow(LOG_HEADER)
                 writer.writerow([
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    user_msg, bot_ans, source, score, matched_q, event_id
+                    user_msg, bot_ans, source, score, matched_q, event_id, user_uuid
                 ])
         except Exception:
             pass
@@ -598,13 +617,12 @@ def load_panels_from_postgres(event_id: int | None = None):
             f"درباره {kind_label} {title} توضیح بده"
         )
         # Selector-facing display text: one clean sentence, not the four-part
-        # run-on question above, and with long semicolon-clause titles
-        # shortened. select_best_candidate()'s LLM judge is asked whether an
-        # option "DIRECTLY and SPECIFICALLY" answers the user's question; a
-        # multi-question blob -- or a very long title -- reads as ambiguous
-        # to it and gets rejected even when it's the correct top FAISS
-        # match. `question` and `search_text` (the rich blob, real title)
-        # still drive embedding/exact-match, unchanged.
+        # run-on question above. select_best_candidate()'s LLM judge is asked
+        # whether an option "DIRECTLY and SPECIFICALLY" answers the user's
+        # question; a multi-question blob reads as ambiguous to it and gets
+        # rejected even when it's the correct top FAISS match. `question` and
+        # `search_text` (the rich blob) still drive embedding/exact-match,
+        # unchanged.
         question_display = f"{kind_label} {_short_title(title)} چه زمانی و در کجا برگزار می‌شود؟"
 
         speakers_fa = []
@@ -1069,6 +1087,12 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] = []
     lang: str = "fa"
     event_id: int
+    # Populated server-side by iph-app's /api/chat proxy from the caller's
+    # iph_user cookie (see grantChatMissionXp.js's getUserUuid() for the same
+    # pattern) -- absent for guest/unauthenticated chat, which is expected,
+    # not an error. Never trust this as an auth signal, it's unauthenticated
+    # client input forwarded as-is -- log/display only.
+    user_uuid: str | None = None
 
 
 class FAQCreate(BaseModel):
@@ -1553,6 +1577,7 @@ async def select_best_candidate(user_message: str, candidates: list, lang: str =
 async def chat(req: ChatRequest):
     user_message = req.message.strip()
     event_id = req.event_id
+    user_uuid = req.user_uuid
     if not user_message:
         return {"answer": get_fallback_message(event_id, req.lang), "source": "empty"}
 
@@ -1567,7 +1592,7 @@ async def chat(req: ChatRequest):
             ans = f"آخرین سوال شما این بود: «{last_q}»"
         else:
             ans = "تاریخچه‌ای از سوالات شما وجود ندارد."
-        await log_chat_interaction(user_message, ans, "meta", 1.0, event_id=event_id)
+        await log_chat_interaction(user_message, ans, "meta", 1.0, event_id=event_id, user_uuid=user_uuid)
         return {"answer": ans, "source": "meta"}
 
     # ۱. Query Enricher (sync — CPU)
@@ -1576,7 +1601,7 @@ async def chat(req: ChatRequest):
     # ۲. Example search (sync — CPU، مستقل از event، از prompt_config می‌آید)
     example_answer, _ = search_examples(search_query)
     if example_answer:
-        await log_chat_interaction(user_message, example_answer, "example", 1.0, search_query, event_id=event_id)
+        await log_chat_interaction(user_message, example_answer, "example", 1.0, search_query, event_id=event_id, user_uuid=user_uuid)
         return {"answer": example_answer, "source": "example"}
 
     # ── این event هنوز هیچ KB‌ای ندارد (هرگز rebuild نشده یا واقعاً خالی است) ──
@@ -1584,7 +1609,7 @@ async def chat(req: ChatRequest):
     knowledge_base = KNOWLEDGE_BASE.get(event_id)
     if not knowledge_base:
         fallback = get_fallback_message(event_id, req.lang)
-        await log_chat_interaction(user_message, fallback, "fallback_no_kb", 0.0, event_id=event_id)
+        await log_chat_interaction(user_message, fallback, "fallback_no_kb", 0.0, event_id=event_id, user_uuid=user_uuid)
         return {"answer": fallback, "source": "fallback_no_kb"}
 
     # ۳. Exact / fuzzy search (sync — CPU)
@@ -1594,45 +1619,59 @@ async def chat(req: ChatRequest):
         if exact_item.get("is_directory"):
             ans = format_directory_response(user_message, ans, lang=req.lang)
         matched_q = exact_item.get("question_en") if req.lang == "en" else exact_item["question"]
-        await log_chat_interaction(user_message, ans, "exact", exact_score, matched_q, event_id=event_id)
+        await log_chat_interaction(user_message, ans, "exact", exact_score, matched_q, event_id=event_id, user_uuid=user_uuid)
         return {"answer": ans, "source": "exact"}
 
-    # ۴. FAISS + hybrid (async — شامل embed I/O)
-    index = faiss_index_en.get(event_id) if req.lang == "en" else faiss_index.get(event_id)
-    en_indices = KB_EN_INDICES.get(event_id) if req.lang == "en" else None
-    candidates = await search_hybrid_knowledge(
-        search_query, knowledge_base, index, en_indices, top_k=10, lang=req.lang
-    )
-    if not candidates:
-        fallback = get_fallback_message(event_id, req.lang)
-        await log_chat_interaction(user_message, fallback, "fallback", 0.0, event_id=event_id)
-        return {"answer": fallback, "source": "fallback"}
+    # ۴-۷ همه به Ollama نیاز دارند (embedding در search_hybrid_knowledge،
+    # انتخاب در select_best_candidate) — پس زیر سقف همزمانی محلی قرار می‌گیرند.
+    # اگر ظرف CHAT_QUEUE_WAIT_SECONDS نوبت آزاد نشد، پیام «شلوغ» برمی‌گردد
+    # (بدون رسیدن به Ollama) تا بار روی VPS در زمان قطعی GPU کنترل‌شده بماند.
+    try:
+        await asyncio.wait_for(_chat_llm_semaphore.acquire(), timeout=CHAT_QUEUE_WAIT_SECONDS)
+    except asyncio.TimeoutError:
+        busy = CAPACITY_BUSY_MESSAGE.get(req.lang, CAPACITY_BUSY_MESSAGE["fa"])
+        await log_chat_interaction(user_message, busy, "capacity_limited", 0.0, event_id=event_id, user_uuid=user_uuid)
+        return {"answer": busy, "source": "capacity_limited"}
 
-    print(f"📊 scores: {[round(c['score'],3) for c in candidates]}", flush=True)
+    try:
+        # ۴. FAISS + hybrid (async — شامل embed I/O)
+        index = faiss_index_en.get(event_id) if req.lang == "en" else faiss_index.get(event_id)
+        en_indices = KB_EN_INDICES.get(event_id) if req.lang == "en" else None
+        candidates = await search_hybrid_knowledge(
+            search_query, knowledge_base, index, en_indices, top_k=10, lang=req.lang
+        )
+        if not candidates:
+            fallback = get_fallback_message(event_id, req.lang)
+            await log_chat_interaction(user_message, fallback, "fallback", 0.0, event_id=event_id, user_uuid=user_uuid)
+            return {"answer": fallback, "source": "fallback"}
 
-    # ۵. Threshold filter
-    MIN_SCORE  = 0.50
-    candidates = [c for c in candidates if c["score"] >= MIN_SCORE]
-    if not candidates:
-        fallback = get_fallback_message(event_id, req.lang)
-        await log_chat_interaction(user_message, fallback, "fallback_threshold", 0.0, event_id=event_id)
-        return {"answer": fallback, "source": "fallback"}
+        print(f"📊 scores: {[round(c['score'],3) for c in candidates]}", flush=True)
 
-    # ۶. Ollama انتخاب (async — I/O)
-    selected = await select_best_candidate(search_query, candidates[:5], lang=req.lang)
-    if not selected:
-        fallback = get_fallback_message(event_id, req.lang)
-        await log_chat_interaction(user_message, fallback, "fallback", 0.0, event_id=event_id)
-        return {"answer": fallback, "source": "fallback"}
+        # ۵. Threshold filter
+        MIN_SCORE  = 0.50
+        candidates = [c for c in candidates if c["score"] >= MIN_SCORE]
+        if not candidates:
+            fallback = get_fallback_message(event_id, req.lang)
+            await log_chat_interaction(user_message, fallback, "fallback_threshold", 0.0, event_id=event_id, user_uuid=user_uuid)
+            return {"answer": fallback, "source": "fallback"}
 
-    # ۷. فرمت و برگشت
-    ans = _answer_for_lang(selected["knowledge"], req.lang)
-    if selected["knowledge"].get("is_directory"):
-        ans = format_directory_response(user_message, ans, lang=req.lang)
+        # ۶. Ollama انتخاب (async — I/O)
+        selected = await select_best_candidate(search_query, candidates[:5], lang=req.lang)
+        if not selected:
+            fallback = get_fallback_message(event_id, req.lang)
+            await log_chat_interaction(user_message, fallback, "fallback", 0.0, event_id=event_id, user_uuid=user_uuid)
+            return {"answer": fallback, "source": "fallback"}
 
-    matched_q = selected["knowledge"].get("question_en") if req.lang == "en" else selected["knowledge"]["question"]
-    await log_chat_interaction(user_message, ans, "rag", selected["score"], matched_q, event_id=event_id)
-    return {"answer": ans, "source": "rag"}
+        # ۷. فرمت و برگشت
+        ans = _answer_for_lang(selected["knowledge"], req.lang)
+        if selected["knowledge"].get("is_directory"):
+            ans = format_directory_response(user_message, ans, lang=req.lang)
+
+        matched_q = selected["knowledge"].get("question_en") if req.lang == "en" else selected["knowledge"]["question"]
+        await log_chat_interaction(user_message, ans, "rag", selected["score"], matched_q, event_id=event_id, user_uuid=user_uuid)
+        return {"answer": ans, "source": "rag"}
+    finally:
+        _chat_llm_semaphore.release()
 
 
 # ═══════════════════════════════════════════════
@@ -1662,10 +1701,62 @@ async def get_logs(source: str = None, event_id: int = None, limit: int = 500, _
                     "score":           row.get("Score", "0"),
                     "matched_question": row.get("Matched_Question", ""),
                     "event_id":        row_event_id,
+                    # Blank for rows written before this column existed, and
+                    # for guest/unauthenticated chats -- both expected, not
+                    # errors. iph-apn resolves this to a name/mobile at
+                    # display time via a live app_users join, never stored
+                    # here.
+                    "user_uuid":       row.get("User_Uuid") or None,
                 })
     except Exception as e:
         return {"logs": [], "error": str(e)}
     return {"logs": logs[-limit:]}
+
+
+@app.delete("/logs")
+async def delete_logs(event_id: int = Query(...), _: None = Depends(verify_admin_key)):
+    """
+    فقط ردیف‌هایی که Event_Id آن‌ها دقیقاً برابر event_id است حذف می‌شوند —
+    ردیف‌های event دیگر و ردیف‌های قدیمی بدون Event_Id (مطابق همان استثنای
+    GET /logs، تا گم نشوند) دست‌نخورده می‌مانند. نوشتن با temp-file + os.replace
+    اتمیک است تا اگر پردازه وسط نوشتن kill شود، فایل اصلی نصفه‌نویسی‌شده باقی
+    نماند. زیر همان _log_lock که log_chat_interaction استفاده می‌کند، تا با
+    نوشتن‌های همزمان لاگ جدید race نکند.
+    """
+    async with _log_lock:
+        if not LOG_FILE_PATH.exists():
+            return {"deleted": 0}
+
+        deleted = 0
+        kept_rows = []
+        try:
+            with open(LOG_FILE_PATH, newline="", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames or LOG_HEADER
+                for row in reader:
+                    row_event_id = row.get("Event_Id") or None
+                    if row_event_id is not None and str(row_event_id) == str(event_id):
+                        deleted += 1
+                        continue
+                    kept_rows.append(row)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to read logs: {e}")
+
+        tmp_path = LOG_FILE_PATH.with_suffix(".csv.tmp")
+        try:
+            with open(tmp_path, mode="w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(kept_rows)
+            os.replace(tmp_path, LOG_FILE_PATH)
+        except Exception as e:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail=f"Failed to write logs: {e}")
+
+    return {"deleted": deleted}
 
 
 # ═══════════════════════════════════════════════
