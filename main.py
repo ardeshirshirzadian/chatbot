@@ -318,30 +318,30 @@ async def periodic_ollama_rewarm():
 # ═══════════════════════════════════════════════
 #  لاگ async — بدون race condition
 # ═══════════════════════════════════════════════
-LOG_HEADER = ["Timestamp", "User_Message", "Bot_Answer", "Source", "Score", "Matched_Question", "Event_Id"]
+LOG_HEADER = ["Timestamp", "User_Message", "Bot_Answer", "Source", "Score", "Matched_Question", "Event_Id", "User_Uuid"]
 
 
 def _migrate_log_header_if_stale():
     """
-    اگر chat_logs.csv از قبل با header قدیمی (بدون ستون Event_Id) وجود دارد،
-    فایل قدیمی را کنار می‌گذارد (rename با timestamp) تا نوشتن بعدی یک فایل
-    تازه با header جدید بسازد. فقط یک‌بار لازم است اجرا شود — بعد از اولین
-    self-heal، فایل جدید همیشه header درست را دارد. صدا زدن این تابع باید زیر
-    _log_lock باشد (توسط caller تضمین می‌شود).
+    اگر chat_logs.csv از قبل با header قدیمی (بدون ستون Event_Id یا User_Uuid)
+    وجود دارد، فایل قدیمی را کنار می‌گذارد (rename با timestamp) تا نوشتن بعدی
+    یک فایل تازه با header جدید بسازد. فقط یک‌بار لازم است اجرا شود — بعد از
+    اولین self-heal، فایل جدید همیشه header درست را دارد. صدا زدن این تابع
+    باید زیر _log_lock باشد (توسط caller تضمین می‌شود).
     """
     if not LOG_FILE_PATH.exists():
         return
     try:
         with open(LOG_FILE_PATH, newline="", encoding="utf-8-sig") as f:
             first_line = f.readline()
-        if "Event_Id" not in first_line:
+        if "User_Uuid" not in first_line:
             stamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            LOG_FILE_PATH.rename(LOG_FILE_PATH.with_name(f"{LOG_FILE_PATH.stem}.pre-event-migration-{stamp}.csv"))
+            LOG_FILE_PATH.rename(LOG_FILE_PATH.with_name(f"{LOG_FILE_PATH.stem}.pre-user-uuid-migration-{stamp}.csv"))
     except Exception:
         pass
 
 
-async def log_chat_interaction(user_msg: str, bot_ans: str, source: str, score: float, matched_q: str = "", event_id: int | None = None):
+async def log_chat_interaction(user_msg: str, bot_ans: str, source: str, score: float, matched_q: str = "", event_id: int | None = None, user_uuid: str | None = None):
     async with _log_lock:
         try:
             _migrate_log_header_if_stale()
@@ -353,7 +353,7 @@ async def log_chat_interaction(user_msg: str, bot_ans: str, source: str, score: 
                     writer.writerow(LOG_HEADER)
                 writer.writerow([
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    user_msg, bot_ans, source, score, matched_q, event_id
+                    user_msg, bot_ans, source, score, matched_q, event_id, user_uuid
                 ])
         except Exception:
             pass
@@ -575,6 +575,25 @@ def _format_panel_time(starts_at, ends_at) -> str:
         return ""
 
 
+def _short_title(t: str, max_len: int = 45) -> str:
+    """
+    Selector-display-only title shortener. Panel/workshop titles that
+    combine a short headline with a longer elaboration are consistently
+    authored with a Persian semicolon between the two parts (e.g. "X؛
+    توضیح بیشتر درباره X"). Prefer that natural split; a title with
+    neither a semicolon nor natural brevity falls back to a hard
+    word-boundary character cap. Only feeds question_display/_en -- the
+    real title is untouched everywhere else (question, search_text,
+    answer, and anything shown to the user).
+    """
+    if "؛" in t:
+        t = t.split("؛", 1)[0].strip()
+    if len(t) > max_len:
+        truncated = t[:max_len].rsplit(" ", 1)[0]
+        t = (truncated or t[:max_len]) + "…"
+    return t
+
+
 def load_panels_from_postgres(event_id: int | None = None):
     """
     آیتم‌های پنل/کارگاه از جدول Postgres `panels` — جایگزین knowledge_list
@@ -623,6 +642,14 @@ def load_panels_from_postgres(event_id: int | None = None):
             f"سخنرانان {title} چه کسانی هستند؟ "
             f"درباره {kind_label} {title} توضیح بده"
         )
+        # Selector-facing display text: one clean sentence, not the four-part
+        # run-on question above. select_best_candidate()'s LLM judge is asked
+        # whether an option "DIRECTLY and SPECIFICALLY" answers the user's
+        # question; a multi-question blob reads as ambiguous to it and gets
+        # rejected even when it's the correct top FAISS match. `question` and
+        # `search_text` (the rich blob) still drive embedding/exact-match,
+        # unchanged.
+        question_display = f"{kind_label} {_short_title(title)} چه زمانی و در کجا برگزار می‌شود؟"
 
         speakers_fa = []
         for sp in (speakers or []):
@@ -646,7 +673,7 @@ def load_panels_from_postgres(event_id: int | None = None):
 
         # ── نسخه انگلیسی (اختیاری) — فقط اگر title_en موجود باشد، همان الگوی companies
         title_en_s = (title_en or "").strip()
-        question_en = answer_en = question_en_norm = search_text_en = None
+        question_en = answer_en = question_en_norm = search_text_en = question_display_en = None
         if title_en_s:
             kind_label_en = "Workshop" if is_workshop else "Panel"
             question_en = (
@@ -655,6 +682,7 @@ def load_panels_from_postgres(event_id: int | None = None):
                 f"Who are the speakers at {title_en_s}? "
                 f"Tell me about {title_en_s}"
             )
+            question_display_en = f"When and where is the {kind_label_en.lower()} {_short_title(title_en_s)} held?"
 
             speakers_en = []
             for sp in (speakers or []):
@@ -682,12 +710,14 @@ def load_panels_from_postgres(event_id: int | None = None):
             "event_id": row_event_id,
             "category": category,
             "question": question,
+            "question_display": question_display,
             "question_norm": normalize_text(question),
             "answer": answer,
             "search_text": build_search_text(question, answer, category, "postgres:panels"),
             "source_file": "postgres:panels",
             "is_directory": False,
             "question_en": question_en,
+            "question_display_en": question_display_en,
             "answer_en": answer_en,
             "question_en_norm": question_en_norm,
             "search_text_en": search_text_en,
@@ -1101,6 +1131,14 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] = []
     lang: str = "fa"
     event_id: int
+    # Populated server-side by iph-app's /api/chat proxy from the caller's
+    # iph_user cookie (see grantChatMissionXp.js's getUserUuid() for the same
+    # pattern) -- absent for guest/unauthenticated chat, which is expected,
+    # not an error. Never trust this as an auth signal, it's unauthenticated
+    # client input forwarded as-is -- log/display only. Carried through
+    # _QueueJob.req unchanged for the queued path, so /chat/status's eventual
+    # log write still has it.
+    user_uuid: str | None = None
 
 
 class FAQCreate(BaseModel):
@@ -1551,8 +1589,13 @@ async def select_best_candidate(user_message: str, candidates: list, lang: str =
     if not candidates:
         return None
 
+    def _cand_display_question(item):
+        if lang == "en":
+            return item.get("question_display_en") or item.get("question_en") or item["question"]
+        return item.get("question_display") or item["question"]
+
     options = "".join(
-        f"{i}. {_lang_question(c['knowledge'], lang) or c['knowledge']['question']}\n"
+        f"{i}. {_cand_display_question(c['knowledge'])}\n"
         for i, c in enumerate(candidates, 1)
     )
 
@@ -1603,6 +1646,7 @@ async def select_best_candidate(user_message: str, candidates: list, lang: str =
 async def run_chat_pipeline(req: ChatRequest) -> dict:
     user_message = req.message.strip()
     event_id = req.event_id
+    user_uuid = req.user_uuid
     lang = "en" if req.lang == "en" else "fa"
     if not user_message:
         return {"answer": get_fallback_message(event_id, lang), "source": "empty"}
@@ -1618,7 +1662,7 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
             ans = f"آخرین سوال شما این بود: «{last_q}»"
         else:
             ans = "تاریخچه‌ای از سوالات شما وجود ندارد."
-        await log_chat_interaction(user_message, ans, "meta", 1.0, event_id=event_id)
+        await log_chat_interaction(user_message, ans, "meta", 1.0, event_id=event_id, user_uuid=user_uuid)
         return {"answer": ans, "source": "meta"}
 
     # ۱. Query Enricher (sync CPU — روی thread جدا تا event loop تک‌پردازه را در بار همزمان بلاک نکند)
@@ -1627,7 +1671,7 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
     # ۲. Example search (sync CPU — روی thread جدا، مستقل از event، از prompt_config می‌آید)
     example_answer, _ = await asyncio.to_thread(search_examples, search_query)
     if example_answer:
-        await log_chat_interaction(user_message, example_answer, "example", 1.0, search_query, event_id=event_id)
+        await log_chat_interaction(user_message, example_answer, "example", 1.0, search_query, event_id=event_id, user_uuid=user_uuid)
         return {"answer": example_answer, "source": "example"}
 
     # ── این event هنوز هیچ KB‌ای ندارد (هرگز rebuild نشده یا واقعاً خالی است) ──
@@ -1635,7 +1679,7 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
     knowledge_base = KNOWLEDGE_BASE.get(event_id)
     if not knowledge_base:
         fallback = get_fallback_message(event_id, lang)
-        await log_chat_interaction(user_message, fallback, "fallback_no_kb", 0.0, event_id=event_id)
+        await log_chat_interaction(user_message, fallback, "fallback_no_kb", 0.0, event_id=event_id, user_uuid=user_uuid)
         return {"answer": fallback, "source": "fallback_no_kb"}
 
     # ۳. Exact / fuzzy search (sync CPU — روی thread جدا؛ O(n) روی KNOWLEDGE_BASE همین event)
@@ -1644,7 +1688,7 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
         ans = _lang_answer(exact_item, lang)
         if exact_item.get("is_directory"):
             ans = format_directory_response(user_message, ans, lang=lang)
-        await log_chat_interaction(user_message, ans, "exact", exact_score, _lang_question(exact_item, lang), event_id=event_id)
+        await log_chat_interaction(user_message, ans, "exact", exact_score, _lang_question(exact_item, lang), event_id=event_id, user_uuid=user_uuid)
         return {"answer": ans, "source": "exact"}
 
     # ۴. FAISS + hybrid (async — شامل embed I/O) — index/en_indices صریحاً همین event
@@ -1655,7 +1699,7 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
     )
     if not candidates:
         fallback = get_fallback_message(event_id, lang)
-        await log_chat_interaction(user_message, fallback, "fallback", 0.0, event_id=event_id)
+        await log_chat_interaction(user_message, fallback, "fallback", 0.0, event_id=event_id, user_uuid=user_uuid)
         return {"answer": fallback, "source": "fallback"}
 
     print(f"📊 scores: {[round(c['score'],3) for c in candidates]}", flush=True)
@@ -1665,14 +1709,14 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
     candidates = [c for c in candidates if c["score"] >= MIN_SCORE]
     if not candidates:
         fallback = get_fallback_message(event_id, lang)
-        await log_chat_interaction(user_message, fallback, "fallback_threshold", 0.0, event_id=event_id)
+        await log_chat_interaction(user_message, fallback, "fallback_threshold", 0.0, event_id=event_id, user_uuid=user_uuid)
         return {"answer": fallback, "source": "fallback"}
 
     # ۶. Ollama انتخاب (async — I/O)
     selected = await select_best_candidate(search_query, candidates[:5], lang=lang)
     if not selected:
         fallback = get_fallback_message(event_id, lang)
-        await log_chat_interaction(user_message, fallback, "fallback", 0.0, event_id=event_id)
+        await log_chat_interaction(user_message, fallback, "fallback", 0.0, event_id=event_id, user_uuid=user_uuid)
         return {"answer": fallback, "source": "fallback"}
 
     # ۷. فرمت و برگشت
@@ -1680,7 +1724,7 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
     if selected["knowledge"].get("is_directory"):
         ans = format_directory_response(user_message, ans, lang=lang)
 
-    await log_chat_interaction(user_message, ans, "rag", selected["score"], _lang_question(selected["knowledge"], lang), event_id=event_id)
+    await log_chat_interaction(user_message, ans, "rag", selected["score"], _lang_question(selected["knowledge"], lang), event_id=event_id, user_uuid=user_uuid)
     return {"answer": ans, "source": "rag"}
 
 
@@ -1829,6 +1873,12 @@ async def get_logs(source: str = None, event_id: int = None, limit: int = 500, _
                     "score":           row.get("Score", "0"),
                     "matched_question": row.get("Matched_Question", ""),
                     "event_id":        row_event_id,
+                    # Blank for rows written before this column existed, and
+                    # for guest/unauthenticated chats -- both expected, not
+                    # errors. iph-apn resolves this to a name/mobile at
+                    # display time via a live app_users join, never stored
+                    # here.
+                    "user_uuid":       row.get("User_Uuid") or None,
                 })
     except Exception as e:
         return {"logs": [], "error": str(e)}
