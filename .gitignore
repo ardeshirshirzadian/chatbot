@@ -5,4 +5,5 @@ __pycache__/
 *.save*
 knowledge/chat_logs.csv
 knowledge/knowledge_embeddings.json
+logs_archive/
 *.code-workspace

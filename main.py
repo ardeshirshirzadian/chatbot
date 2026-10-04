@@ -7,6 +7,7 @@ import string
 import asyncio
 import logging
 import time
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -31,6 +32,10 @@ KNOWLEDGE_DIR = BASE_DIR / "knowledge"
 PROMPT_JSON_PATH = BASE_DIR / "prompts" / "system_prompt.json"
 EMBEDDINGS_CACHE_PATH = KNOWLEDGE_DIR / "knowledge_embeddings.json"
 LOG_FILE_PATH = KNOWLEDGE_DIR / "chat_logs.csv"
+# بک‌آپ‌های چرخشی chat_logs (migration header) اینجا نوشته می‌شوند — عمداً خارج از
+# KNOWLEDGE_DIR، چون هر فایلی داخل knowledge/ به‌عنوان محتوای knowledge base خوانده
+# می‌شود (_load_csv_knowledge_items) و یک فایل لاگ هیچ‌وقت نباید وارد آن pipeline شود.
+LOG_ARCHIVE_DIR = BASE_DIR / "logs_archive"
 
 OLLAMA_CHAT_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
 OLLAMA_BASE_URL = OLLAMA_CHAT_URL.replace("/api/chat", "")
@@ -74,6 +79,7 @@ DEFAULT_FALLBACK = "این سؤال خارج از حوزه نمایشگاه ای
 # keep-alive + connection pool — در روزهای نمایشگاه فشار کمتری روی Ollama
 _http: httpx.AsyncClient = None
 _rewarm_task: asyncio.Task = None
+_selfheal_task: asyncio.Task = None
 
 # ── صف /chat و worker pool — ساخته می‌شوند در lifespan startup ──
 _job_queue: asyncio.Queue = None
@@ -105,8 +111,21 @@ en_index_to_kb  = {}   # dict[int, list] — نگاشت موقعیت در faiss_
 embedding_dimension    = {}   # dict[int, int]
 embedding_dimension_en = {}   # dict[int, int]
 
+# ── self-heal: fingerprint هر event در زمان آخرین rebuild موفق ──
+# dict[int, dict] — {event_id: {"faq": md5hex, "companies": md5hex, "panels": md5hex}}
+# با fingerprint زنده‌ی Postgres مقایسه می‌شود تا drift (مثلاً نوشتن مستقیم روی DB
+# بدون عبور از این سرویس) ظرف چند دقیقه خودش را تشخیص و اصلاح کند.
+kb_fingerprint = {}
+
 # قفل نوشتن لاگ — جلوگیری از race condition هنگام درخواست‌های همزمان
 _log_lock = asyncio.Lock()
+
+# ── self-heal periodic — هر چند دقیقه fingerprint حافظه را با Postgres مقایسه می‌کند ──
+SELF_HEAL_INTERVAL_SECONDS = 600  # ۱۰ دقیقه
+
+# ── آدرس backend دیگر (GPU↔VPS) — فقط برای هشدار drift بین دو DB مستقل، best-effort ──
+PEER_BACKEND_URL = os.getenv("PEER_BACKEND_URL")
+PEER_FETCH_TIMEOUT_SECONDS = 5.0
 
 
 # ═══════════════════════════════════════════════
@@ -318,30 +337,37 @@ async def periodic_ollama_rewarm():
 # ═══════════════════════════════════════════════
 #  لاگ async — بدون race condition
 # ═══════════════════════════════════════════════
-LOG_HEADER = ["Timestamp", "User_Message", "Bot_Answer", "Source", "Score", "Matched_Question", "Event_Id"]
+LOG_HEADER = ["Timestamp", "User_Message", "Bot_Answer", "Source", "Score", "Matched_Question", "Event_Id", "User_Uuid"]
 
 
 def _migrate_log_header_if_stale():
     """
-    اگر chat_logs.csv از قبل با header قدیمی (بدون ستون Event_Id) وجود دارد،
-    فایل قدیمی را کنار می‌گذارد (rename با timestamp) تا نوشتن بعدی یک فایل
-    تازه با header جدید بسازد. فقط یک‌بار لازم است اجرا شود — بعد از اولین
-    self-heal، فایل جدید همیشه header درست را دارد. صدا زدن این تابع باید زیر
-    _log_lock باشد (توسط caller تضمین می‌شود).
+    اگر chat_logs.csv از قبل با header قدیمی (بدون ستون Event_Id یا User_Uuid)
+    وجود دارد، فایل قدیمی را کنار می‌گذارد (rename با timestamp) تا نوشتن بعدی
+    یک فایل تازه با header جدید بسازد. فقط یک‌بار لازم است اجرا شود — بعد از
+    اولین self-heal، فایل جدید همیشه header درست را دارد. صدا زدن این تابع
+    باید زیر _log_lock باشد (توسط caller تضمین می‌شود).
+
+    فایل کنار گذاشته‌شده به LOG_ARCHIVE_DIR منتقل می‌شود، نه به یک نام دیگر در
+    همان KNOWLEDGE_DIR — قبلاً دقیقاً همین‌جا باقی می‌ماند و چون نامش با فیلتر
+    exclusion دقیق _load_csv_knowledge_items مطابقت نداشت، هر سطرش به اشتباه
+    به‌عنوان یک آیتم دایرکتوری شرکت‌ها در knowledge base لود می‌شد (باگ واقعی،
+    کشف‌شده ۲۰۲۶-۱۰-۰۴ — به CHATBOT_ARCHITECTURE.md نگاه کنید).
     """
     if not LOG_FILE_PATH.exists():
         return
     try:
         with open(LOG_FILE_PATH, newline="", encoding="utf-8-sig") as f:
             first_line = f.readline()
-        if "Event_Id" not in first_line:
+        if "User_Uuid" not in first_line:
             stamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            LOG_FILE_PATH.rename(LOG_FILE_PATH.with_name(f"{LOG_FILE_PATH.stem}.pre-event-migration-{stamp}.csv"))
+            LOG_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+            LOG_FILE_PATH.rename(LOG_ARCHIVE_DIR / f"{LOG_FILE_PATH.stem}.pre-user-uuid-migration-{stamp}.csv")
     except Exception:
         pass
 
 
-async def log_chat_interaction(user_msg: str, bot_ans: str, source: str, score: float, matched_q: str = "", event_id: int | None = None):
+async def log_chat_interaction(user_msg: str, bot_ans: str, source: str, score: float, matched_q: str = "", event_id: int | None = None, user_uuid: str | None = None):
     async with _log_lock:
         try:
             _migrate_log_header_if_stale()
@@ -353,7 +379,7 @@ async def log_chat_interaction(user_msg: str, bot_ans: str, source: str, score: 
                     writer.writerow(LOG_HEADER)
                 writer.writerow([
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    user_msg, bot_ans, source, score, matched_q, event_id
+                    user_msg, bot_ans, source, score, matched_q, event_id, user_uuid
                 ])
         except Exception:
             pass
@@ -643,13 +669,12 @@ def load_panels_from_postgres(event_id: int | None = None):
             f"درباره {kind_label} {title} توضیح بده"
         )
         # Selector-facing display text: one clean sentence, not the four-part
-        # run-on question above, and with long semicolon-clause titles
-        # shortened. select_best_candidate()'s LLM judge is asked whether an
-        # option "DIRECTLY and SPECIFICALLY" answers the user's question; a
-        # multi-question blob -- or a very long title -- reads as ambiguous
-        # to it and gets rejected even when it's the correct top FAISS
-        # match. `question` and `search_text` (the rich blob, real title)
-        # still drive embedding/exact-match, unchanged.
+        # run-on question above. select_best_candidate()'s LLM judge is asked
+        # whether an option "DIRECTLY and SPECIFICALLY" answers the user's
+        # question; a multi-question blob reads as ambiguous to it and gets
+        # rejected even when it's the correct top FAISS match. `question` and
+        # `search_text` (the rich blob) still drive embedding/exact-match,
+        # unchanged.
         question_display = f"{kind_label} {_short_title(title)} چه زمانی و در کجا برگزار می‌شود؟"
 
         speakers_fa = []
@@ -727,6 +752,83 @@ def load_panels_from_postgres(event_id: int | None = None):
     return panel_items
 
 
+_FINGERPRINT_SOURCES = {
+    "faq": ("faq", "updated_at"),
+    "companies": ("companies", "synced_at"),
+    "panels": ("panels", "synced_at"),
+}
+
+
+def compute_kb_fingerprint(event_id: int) -> dict:
+    """
+    یک fingerprint ارزان (بدون embedding، بدون خواندن کل متن) برای هر سه
+    منبع (faq/companies/panels) این event، مستقیماً از Postgres.
+    md5(id::text || ':' || coalesce(<زمان آخرین نوشتن>::text, ''), ',' ORDER BY id)
+    — هر تغییر در مجموعه‌ی idها یا در زمان آخرین نوشتن یک ردیف (insert/update/
+    delete) hash را عوض می‌کند؛ صرفاً شمارش (count) این را تشخیص نمی‌داد (یک
+    delete + یک insert می‌توانست count را ثابت نگه دارد).
+    خروجی: {"faq": md5hex, "companies": md5hex, "panels": md5hex} — هرکدام
+    می‌تواند None باشد اگر خواندن آن جدول با خطا مواجه شود (قطعی موقت DB)،
+    که caller باید آن را به‌عنوان "نامعلوم، فعلاً rebuild نکن" در نظر بگیرد.
+    """
+    fingerprints = {}
+    conn = None
+    try:
+        conn = get_faq_db_connection()
+        with conn.cursor() as cur:
+            for key, (table, ts_col) in _FINGERPRINT_SOURCES.items():
+                try:
+                    cur.execute(
+                        f"SELECT md5(coalesce(string_agg(id::text || ':' || "
+                        f"coalesce({ts_col}::text, ''), ',' ORDER BY id), '')) "
+                        f"FROM {table} WHERE event_id = %s",
+                        (event_id,),
+                    )
+                    fingerprints[key] = cur.fetchone()[0]
+                except Exception as e:
+                    print(f"⚠️  fingerprint({key}, event_id={event_id}) failed: {e}", flush=True)
+                    fingerprints[key] = None
+    except Exception as e:
+        print(f"⚠️  compute_kb_fingerprint(event_id={event_id}) could not connect: {e}", flush=True)
+        return {key: None for key in _FINGERPRINT_SOURCES}
+    finally:
+        if conn:
+            conn.close()
+
+    # ── فایل‌های CSV داخل knowledge/ فقط به event_id=1 نسبت داده می‌شوند
+    # (همان قرارداد load_all_knowledge_bases) — پس این بخش فقط برای آن event است.
+    # drift در این فایل‌ها (یک CSV جدید، حذف‌شده، یا تغییریافته) با شمارش/md5 از
+    # Postgres قابل تشخیص نیست؛ بدون این، دقیقاً همان باگ ۲۰۲۶-۱۰-۰۴ (یک فایل لاگ
+    # که اشتباهاً به‌عنوان knowledge لود شد) برای self-heal نامرئی می‌ماند.
+    if event_id == 1:
+        try:
+            fingerprints["csv"] = _csv_source_fingerprint()
+        except Exception as e:
+            print(f"⚠️  csv fingerprint failed: {e}", flush=True)
+            fingerprints["csv"] = None
+
+    return fingerprints
+
+
+def _csv_source_fingerprint() -> str:
+    """
+    md5 روی (نام, حجم, mtime) هر CSV واجد شرایط در knowledge/ — نه محتوا (گرفتن
+    hash محتوای یک فایل ۴۰۰KBایی هر ۱۰ دقیقه بی‌دلیل سنگین است؛ تغییر حجم/mtime
+    برای تشخیص drift کافی است). فقط فیلتر نام (_eligible_csv_files) — نه فیلتر
+    header — چون این فقط برای تشخیص "چیزی در این پوشه عوض شد" است، نه برای
+    تصمیم‌گیری درباره‌ی اینکه چه چیزی واقعاً لود می‌شود (آن تصمیم در
+    _load_csv_knowledge_items گرفته می‌شود).
+    """
+    parts = []
+    for f in _eligible_csv_files():
+        try:
+            st = f.stat()
+            parts.append(f"{f.name}:{st.st_size}:{int(st.st_mtime)}")
+        except OSError:
+            continue
+    return hashlib.md5(",".join(parts).encode("utf-8")).hexdigest()
+
+
 def load_all_knowledge_bases(event_id: int | None = None) -> dict:
     """
     خروجی: {event_id: [item, ...]} — یک KB جدا به‌ازای هر local event_id.
@@ -754,6 +856,36 @@ def load_all_knowledge_bases(event_id: int | None = None) -> dict:
     return by_event
 
 
+# ستون‌های مشترک بین همه‌ی نسخه‌های تاریخی header فایل chat_logs.csv (قدیم و جدید) —
+# هر CSVای که این ستون‌ها را (حداقل) داشته باشد قطعاً یک فایل لاگ است، نه knowledge،
+# صرف‌نظر از نام فایل. این دقیقاً همان باگی را می‌گیرد که کشف شد: یک بک‌آپ چرخشی
+# chat_logs با نام غیرمنتظره (مثلاً بعد از یک migration rename) که از فیلتر
+# نام‌محور رد شده بود و هر سطرش به اشتباه به‌عنوان یک "شرکت" در دایرکتوری لود می‌شد
+# (۲۰۲۶-۱۰-۰۴). عمداً به‌جای allowlist/نام فایل: یک فایل CSV دلخواه که ادمین در
+# knowledge/ می‌گذارد باید بدون تغییر کد قابل لود باشد (هدف اصلی این تابع) — فقط
+# شکل خاص "این یک لاگ است" باید رد شود، نه هر نام ناشناخته‌ای.
+_CHAT_LOG_HEADER_SIGNATURE = {
+    "timestamp", "user_message", "bot_answer", "source", "score", "matched_question",
+}
+
+
+def _eligible_csv_files() -> list:
+    """
+    فایل‌های CSV داخل KNOWLEDGE_DIR که _load_csv_knowledge_items ممکن است لود کند —
+    فقط فیلتر نام (faq.csv/companies.csv/chat_logs.csv حذف می‌شوند). فیلتر دوم
+    (header-based، برای بک‌آپ‌های لاگ با نام دیگر) اینجا چک نمی‌شود چون نیاز به باز
+    کردن فایل دارد؛ caller (هم لودر، هم fingerprint) خودش header را چک می‌کند.
+    خروجی مرتب‌شده (برای fingerprint پایدار).
+    """
+    if not KNOWLEDGE_DIR.exists():
+        return []
+    return sorted(
+        (f for f in KNOWLEDGE_DIR.glob("*.csv")
+         if f.name not in ("chat_logs.csv", "faq.csv", "companies.csv")),
+        key=lambda f: f.name,
+    )
+
+
 def _load_csv_knowledge_items() -> list:
     """CSV fallback (companies.csv/faq.csv دیگر استفاده نمی‌شوند، فقط فایل‌های
     دیگر) — بدون مفهوم event، همیشه به event_id=1 نسبت داده می‌شود (در
@@ -761,10 +893,7 @@ def _load_csv_knowledge_items() -> list:
     knowledge_list = []
     # faq.csv و companies.csv دیگر خوانده نمی‌شوند — هر دو اکنون از Postgres می‌آیند.
     # هر فایل CSV دیگری (در صورت وجود) طبق منطق قبلی پردازش می‌شود.
-    csv_files = [
-        f for f in KNOWLEDGE_DIR.glob("*.csv")
-        if f.name not in ("chat_logs.csv", "faq.csv", "companies.csv")
-    ]
+    csv_files = _eligible_csv_files()
 
     for file_path in csv_files:
         try:
@@ -779,6 +908,15 @@ def _load_csv_knowledge_items() -> list:
                 except Exception:
                     reader = csv.DictReader(f)
                 headers = [h.strip().lower() for h in (reader.fieldnames or [])]
+
+                if _CHAT_LOG_HEADER_SIGNATURE.issubset(set(headers)):
+                    print(
+                        f"⏭️  Skipping {file_path.name}: header matches the chat-log schema, "
+                        f"not a knowledge CSV (would misparse log rows as directory entries)",
+                        flush=True,
+                    )
+                    continue
+
                 is_faq  = "question" in headers
 
                 file_rows_count = 0
@@ -906,7 +1044,7 @@ async def rebuild_knowledge_base(event_id: int | None = None) -> bool:
         False اگر rebuild شکست خورد (global های قبلی دست‌نخورده ماندند).
     """
     global KNOWLEDGE_BASE, faiss_index, embedding_dimension
-    global faiss_index_en, embedding_dimension_en, en_index_to_kb
+    global faiss_index_en, embedding_dimension_en, en_index_to_kb, kb_fingerprint
 
     try:
         new_kb_by_event = load_all_knowledge_bases(event_id)
@@ -1006,6 +1144,16 @@ async def rebuild_knowledge_base(event_id: int | None = None) -> bool:
         faiss_index_en.update(new_indices_en)
         embedding_dimension_en.update(new_dims_en)
         en_index_to_kb.update(new_en_index_to_kb_by_event)
+
+        # ── fingerprint تازه برای همین event(ها) — baseline بعدی self-heal ──
+        # بعد از دیتابیس، نه قبل — اگر همین‌جا خطا بدهد rebuild را fail نمی‌کند،
+        # فقط یعنی self-heal دور بعدی دوباره تلاش می‌کند.
+        for ev in new_kb_by_event:
+            try:
+                kb_fingerprint[ev] = compute_kb_fingerprint(ev)
+            except Exception as e:
+                print(f"⚠️  could not record post-rebuild fingerprint for event_id={ev}: {e}", flush=True)
+
         return True
 
     except Exception as e:
@@ -1032,13 +1180,97 @@ async def _retry_rebuild_knowledge_base_until_ready(max_attempts: int = 20, dela
     print(f"❌ Self-healing retry gave up after {max_attempts} attempts — knowledge base still empty", flush=True)
 
 
+async def _fetch_peer_fingerprint(event_id: int) -> dict | None:
+    """
+    best-effort: fingerprint زنده‌ی backend دیگر (GPU↔VPS) را برای همین event
+    می‌گیرد. اگر PEER_BACKEND_URL ست نشده یا peer در دسترس نباشد/timeout بدهد،
+    None برمی‌گرداند — caller این را "قابل مقایسه نیست، رد شو" در نظر می‌گیرد،
+    نه خطا. دو backend هیچ‌وقت در مسیر اصلی /chat به هم وابسته نمی‌شوند؛ این
+    فقط یک چک تشخیصی دوره‌ای است.
+    """
+    if not PEER_BACKEND_URL:
+        return None
+    try:
+        resp = await _http.get(
+            f"{PEER_BACKEND_URL}/admin/kb-fingerprint",
+            params={"event_id": event_id},
+            headers={"X-Admin-Key": ADMIN_API_KEY or ""},
+            timeout=PEER_FETCH_TIMEOUT_SECONDS,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.info(f"peer fingerprint unavailable for event_id={event_id} (context=selfheal_peer_check): {type(e).__name__}: {e}")
+        return None
+
+
+async def periodic_kb_drift_selfheal():
+    """
+    هر SELF_HEAL_INTERVAL_SECONDS: برای هر event فعلاً شناخته‌شده، fingerprint
+    زنده‌ی Postgres را با fingerprint ثبت‌شده‌ی آخرین rebuild موفق مقایسه می‌کند.
+    اگر فرق داشت (یعنی چیزی مستقیماً روی DB نوشته شده، بدون عبور از این سرویس —
+    دقیقاً سناریویی که در Postgres هیچ ردی نداشت و منجر به این self-heal شد)
+    rebuild تک‌event را صدا می‌زند و دقیقاً کدام منبع (faq/companies/panels) فرق
+    داشت را لاگ می‌کند. هرگز سرویس را پایین نمی‌آورد یا /chat را بلاک نمی‌کند:
+    اگر rebuild شکست بخورد، KB قبلی دست‌نخورده سرویس‌دهی را ادامه می‌دهد و دور
+    بعدی (۱۰ دقیقه‌ی دیگر) دوباره تلاش می‌شود.
+
+    علاوه بر این، اگر PEER_BACKEND_URL ست شده باشد، fingerprint خودش را با
+    fingerprint زنده‌ی backend دیگر مقایسه می‌کند (فقط faq — جایی که dual-write
+    هنگام create می‌تواند بی‌صدا شکست بخورد) و در صورت تفاوت فقط هشدار می‌دهد
+    (rebuild نمی‌کند — دو DB عمداً مستقل‌اند، این فقط برای تشخیص سریع‌تر یک
+    dual-write ناموفق است، نه یک درست‌کننده‌ی خودکار).
+    """
+    while True:
+        await asyncio.sleep(SELF_HEAL_INTERVAL_SECONDS)
+        for event_id in list(KNOWLEDGE_BASE.keys()):
+            try:
+                live_fp = compute_kb_fingerprint(event_id)
+                if any(v is None for v in live_fp.values()):
+                    logger.warning(f"self-heal: could not read fingerprint for event_id={event_id} (DB error) — skipping this tick")
+                    continue
+
+                stored_fp = kb_fingerprint.get(event_id)
+                if stored_fp != live_fp:
+                    changed = [k for k in live_fp if (stored_fp or {}).get(k) != live_fp.get(k)]
+
+                    def _short(v):
+                        return v[:8] if v else "<none>"
+
+                    old_vals = {k: _short((stored_fp or {}).get(k)) for k in changed}
+                    new_vals = {k: _short(live_fp.get(k)) for k in changed}
+                    logger.warning(
+                        f"self-heal: event_id={event_id} drift detected in {changed} "
+                        f"(old={old_vals}, new={new_vals}) — rebuilding"
+                    )
+                    ok = await rebuild_knowledge_base(event_id)
+                    if ok:
+                        logger.info(f"self-heal: event_id={event_id} rebuilt successfully, fingerprint updated")
+                    else:
+                        logger.error(
+                            f"self-heal: event_id={event_id} rebuild FAILED — serving previous "
+                            f"(stale) knowledge base, will retry next tick"
+                        )
+
+                # ── مقایسه‌ی cross-backend، best-effort، فقط هشدار (هرگز rebuild) ──
+                peer_fp = await _fetch_peer_fingerprint(event_id)
+                if peer_fp and peer_fp.get("faq") and live_fp.get("faq") and peer_fp["faq"] != live_fp["faq"]:
+                    logger.warning(
+                        f"self-heal: event_id={event_id} FAQ fingerprint differs from peer backend "
+                        f"(mine={live_fp['faq'][:8]}, peer={peer_fp['faq'][:8]}) — "
+                        f"possible missed dual-write; check the sync-to-primary/sync-to-secondary reconciliation"
+                    )
+            except Exception as e:
+                logger.error(f"self-heal: unexpected error for event_id={event_id}: {type(e).__name__}: {e}", exc_info=True)
+
+
 # ═══════════════════════════════════════════════
 #  Lifespan — startup / shutdown
 # ═══════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global BOT_SETTINGS, prompt_config, _http, _rewarm_task
-    global _job_queue, _slot_semaphore, _queue_worker_tasks
+    global _job_queue, _slot_semaphore, _queue_worker_tasks, _selfheal_task
 
     # ── ساخت httpx client با connection pool ──
     _http = httpx.AsyncClient(
@@ -1082,12 +1314,22 @@ async def lifespan(app: FastAPI):
     ]
     print(f"✅ Chat queue workers started: {PROCESSING_SLOTS}", flush=True)
 
+    # ── self-heal دوره‌ای drift بین حافظه و Postgres (هر ۱۰ دقیقه) ──
+    _selfheal_task = asyncio.create_task(periodic_kb_drift_selfheal())
+    print(f"✅ KB drift self-heal scheduled every {SELF_HEAL_INTERVAL_SECONDS}s", flush=True)
+
     yield
 
     # ── shutdown ──
     _rewarm_task.cancel()
     try:
         await _rewarm_task
+    except asyncio.CancelledError:
+        pass
+
+    _selfheal_task.cancel()
+    try:
+        await _selfheal_task
     except asyncio.CancelledError:
         pass
 
@@ -1132,6 +1374,14 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] = []
     lang: str = "fa"
     event_id: int
+    # Populated server-side by iph-app's /api/chat proxy from the caller's
+    # iph_user cookie (see grantChatMissionXp.js's getUserUuid() for the same
+    # pattern) -- absent for guest/unauthenticated chat, which is expected,
+    # not an error. Never trust this as an auth signal, it's unauthenticated
+    # client input forwarded as-is -- log/display only. Carried through
+    # _QueueJob.req unchanged for the queued path, so /chat/status's eventual
+    # log write still has it.
+    user_uuid: str | None = None
 
 
 class FAQCreate(BaseModel):
@@ -1639,6 +1889,7 @@ async def select_best_candidate(user_message: str, candidates: list, lang: str =
 async def run_chat_pipeline(req: ChatRequest) -> dict:
     user_message = req.message.strip()
     event_id = req.event_id
+    user_uuid = req.user_uuid
     lang = "en" if req.lang == "en" else "fa"
     if not user_message:
         return {"answer": get_fallback_message(event_id, lang), "source": "empty"}
@@ -1654,7 +1905,7 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
             ans = f"آخرین سوال شما این بود: «{last_q}»"
         else:
             ans = "تاریخچه‌ای از سوالات شما وجود ندارد."
-        await log_chat_interaction(user_message, ans, "meta", 1.0, event_id=event_id)
+        await log_chat_interaction(user_message, ans, "meta", 1.0, event_id=event_id, user_uuid=user_uuid)
         return {"answer": ans, "source": "meta"}
 
     # ۱. Query Enricher (sync CPU — روی thread جدا تا event loop تک‌پردازه را در بار همزمان بلاک نکند)
@@ -1663,7 +1914,7 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
     # ۲. Example search (sync CPU — روی thread جدا، مستقل از event، از prompt_config می‌آید)
     example_answer, _ = await asyncio.to_thread(search_examples, search_query)
     if example_answer:
-        await log_chat_interaction(user_message, example_answer, "example", 1.0, search_query, event_id=event_id)
+        await log_chat_interaction(user_message, example_answer, "example", 1.0, search_query, event_id=event_id, user_uuid=user_uuid)
         return {"answer": example_answer, "source": "example"}
 
     # ── این event هنوز هیچ KB‌ای ندارد (هرگز rebuild نشده یا واقعاً خالی است) ──
@@ -1671,7 +1922,7 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
     knowledge_base = KNOWLEDGE_BASE.get(event_id)
     if not knowledge_base:
         fallback = get_fallback_message(event_id, lang)
-        await log_chat_interaction(user_message, fallback, "fallback_no_kb", 0.0, event_id=event_id)
+        await log_chat_interaction(user_message, fallback, "fallback_no_kb", 0.0, event_id=event_id, user_uuid=user_uuid)
         return {"answer": fallback, "source": "fallback_no_kb"}
 
     # ۳. Exact / fuzzy search (sync CPU — روی thread جدا؛ O(n) روی KNOWLEDGE_BASE همین event)
@@ -1680,7 +1931,7 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
         ans = _lang_answer(exact_item, lang)
         if exact_item.get("is_directory"):
             ans = format_directory_response(user_message, ans, lang=lang)
-        await log_chat_interaction(user_message, ans, "exact", exact_score, _lang_question(exact_item, lang), event_id=event_id)
+        await log_chat_interaction(user_message, ans, "exact", exact_score, _lang_question(exact_item, lang), event_id=event_id, user_uuid=user_uuid)
         return {"answer": ans, "source": "exact"}
 
     # ۴. FAISS + hybrid (async — شامل embed I/O) — index/en_indices صریحاً همین event
@@ -1691,7 +1942,7 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
     )
     if not candidates:
         fallback = get_fallback_message(event_id, lang)
-        await log_chat_interaction(user_message, fallback, "fallback", 0.0, event_id=event_id)
+        await log_chat_interaction(user_message, fallback, "fallback", 0.0, event_id=event_id, user_uuid=user_uuid)
         return {"answer": fallback, "source": "fallback"}
 
     print(f"📊 scores: {[round(c['score'],3) for c in candidates]}", flush=True)
@@ -1701,14 +1952,14 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
     candidates = [c for c in candidates if c["score"] >= MIN_SCORE]
     if not candidates:
         fallback = get_fallback_message(event_id, lang)
-        await log_chat_interaction(user_message, fallback, "fallback_threshold", 0.0, event_id=event_id)
+        await log_chat_interaction(user_message, fallback, "fallback_threshold", 0.0, event_id=event_id, user_uuid=user_uuid)
         return {"answer": fallback, "source": "fallback"}
 
     # ۶. Ollama انتخاب (async — I/O)
     selected = await select_best_candidate(search_query, candidates[:5], lang=lang)
     if not selected:
         fallback = get_fallback_message(event_id, lang)
-        await log_chat_interaction(user_message, fallback, "fallback", 0.0, event_id=event_id)
+        await log_chat_interaction(user_message, fallback, "fallback", 0.0, event_id=event_id, user_uuid=user_uuid)
         return {"answer": fallback, "source": "fallback"}
 
     # ۷. فرمت و برگشت
@@ -1716,7 +1967,7 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
     if selected["knowledge"].get("is_directory"):
         ans = format_directory_response(user_message, ans, lang=lang)
 
-    await log_chat_interaction(user_message, ans, "rag", selected["score"], _lang_question(selected["knowledge"], lang), event_id=event_id)
+    await log_chat_interaction(user_message, ans, "rag", selected["score"], _lang_question(selected["knowledge"], lang), event_id=event_id, user_uuid=user_uuid)
     return {"answer": ans, "source": "rag"}
 
 
@@ -1865,6 +2116,12 @@ async def get_logs(source: str = None, event_id: int = None, limit: int = 500, _
                     "score":           row.get("Score", "0"),
                     "matched_question": row.get("Matched_Question", ""),
                     "event_id":        row_event_id,
+                    # Blank for rows written before this column existed, and
+                    # for guest/unauthenticated chats -- both expected, not
+                    # errors. iph-apn resolves this to a name/mobile at
+                    # display time via a live app_users join, never stored
+                    # here.
+                    "user_uuid":       row.get("User_Uuid") or None,
                 })
     except Exception as e:
         return {"logs": [], "error": str(e)}
@@ -2290,3 +2547,33 @@ async def admin_sync_panels(payload: dict = Body(...), _: None = Depends(verify_
 
     await rebuild_knowledge_base(event_id)
     return {"synced": len(panels), "event_id": event_id, "rasayesh_event_id": rasayesh_event_id}
+
+
+# ═══════════════════════════════════════════════
+#  Admin — rebuild دستی و fingerprint (پشتیبانی self-heal + مقایسه‌ی cross-backend)
+#  همان محافظت X-Admin-Key.
+# ═══════════════════════════════════════════════
+@app.post("/admin/rebuild")
+async def admin_rebuild(event_id: int | None = Query(None), _: None = Depends(verify_admin_key)):
+    """
+    rebuild دستی، بدون نیاز به یک نوشتن admin دیگر و بدون ری‌استارت سرویس —
+    همان rebuild_knowledge_base که startup/sync/self-heal استفاده می‌کنند.
+    event_id=None یعنی rebuild کامل (همه‌ی eventهای شناخته‌شده).
+    """
+    ok = await rebuild_knowledge_base(event_id)
+    by_event = {str(ev): len(kb) for ev, kb in KNOWLEDGE_BASE.items()}
+    return {
+        "rebuilt": ok,
+        "knowledge_base_items": sum(by_event.values()),
+        "knowledge_base_items_by_event": by_event,
+    }
+
+
+@app.get("/admin/kb-fingerprint")
+async def admin_kb_fingerprint(event_id: int = Query(...), _: None = Depends(verify_admin_key)):
+    """
+    fingerprint زنده (مستقیماً از Postgres، نه از cache) برای این event —
+    توسط self-heal داخلی (مقایسه با کش) و توسط backend دیگر (مقایسه‌ی
+    cross-backend، فقط faq) استفاده می‌شود.
+    """
+    return compute_kb_fingerprint(event_id)
