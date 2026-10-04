@@ -32,6 +32,9 @@ BASE_DIR = Path(__file__).resolve().parent
 KNOWLEDGE_DIR = BASE_DIR / "knowledge"
 PROMPT_JSON_PATH = BASE_DIR / "prompts" / "system_prompt.json"
 EMBEDDINGS_CACHE_PATH = KNOWLEDGE_DIR / "knowledge_embeddings.json"
+# کش جداگانه برای embeddingهای eval flag normalize_fa (v2) — کلیدها متن
+# normalize_text_v2-شده‌اند، نه v1، پس نباید با کش بالا قاطی شوند.
+EMBEDDINGS_CACHE_PATH_V2 = KNOWLEDGE_DIR / "knowledge_embeddings_v2.json"
 LOG_FILE_PATH = KNOWLEDGE_DIR / "chat_logs.csv"
 # بک‌آپ‌های چرخشی chat_logs (migration header) اینجا نوشته می‌شوند — عمداً خارج از
 # KNOWLEDGE_DIR، چون هر فایلی داخل knowledge/ به‌عنوان محتوای knowledge base خوانده
@@ -48,6 +51,36 @@ EMBED_MODEL = "bge-m3"
 # module-level شد تا هم مسیر /chat و هم GET /eval/config (eval tooling،
 # iph-apn) بتوانند همین مقدار واقعی در حال اجرا را بخوانند، نه یک کپی جدا.
 MIN_SCORE = 0.50
+
+# ═══════════════════════════════════════════════
+#  PRODUCTION_FLAGS — تک منبع تنظیمات برای اینکه کدام بهبودهای accuracy
+#  (۲۰۲۶-۱۰-۰۴) روی ترافیک واقعی /chat فعال‌اند. همه‌چیز پیش‌فرض خاموش —
+#  تا وقتی eval set واقعی برچسب‌گذاری نشده و این پرچم‌ها را در برابر baseline
+#  نسنجیده، هیچ‌کدام در production روشن نمی‌شوند. /chat این دیکشنری را
+#  مستقیماً به resolve_answer به‌عنوان overrides می‌فرستد — یعنی وقتی همه
+#  خاموش‌اند (اینجا، همیشه، تا اطلاع ثانوی) رفتار /chat دقیقاً مثل قبل از
+#  این تغییر است، بدون هیچ تفاوتی. /eval/chat به‌جای این، overrides صریح
+#  per-request از بدنه‌ی خودش می‌گیرد (ممکن است با PRODUCTION_FLAGS فرق کند).
+# ═══════════════════════════════════════════════
+def _env_bool(name: str) -> bool:
+    return os.getenv(name, "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float_or_none(name: str) -> float | None:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+PRODUCTION_FLAGS = {
+    "normalize_fa": _env_bool("FLAG_NORMALIZE_FA"),
+    "judge_abstain": _env_bool("FLAG_JUDGE_ABSTAIN"),
+    "threshold": _env_float_or_none("FLAG_THRESHOLD"),
+}
 
 # ── git commit — یک‌بار در startup خوانده می‌شود (نه هر request)، برای
 # GET /eval/config: eval run باید دقیقاً بداند کدام نسخه‌ی کد پاسخ داده.
@@ -137,6 +170,17 @@ en_index_to_kb  = {}   # dict[int, list] — نگاشت موقعیت در faiss_
 embedding_dimension    = {}   # dict[int, int]
 embedding_dimension_en = {}   # dict[int, int]
 
+# ── eval flag normalize_fa: دقیقاً همان ساختار بالا، اما ساخته‌شده روی
+# normalize_text_v2 به‌جای normalize_text. کاملاً جداگانه، هرگز جای index
+# اصلی را نمی‌گیرد — فقط وقتی override/production-flag صریحاً فعال باشد
+# resolve_answer از این‌ها استفاده می‌کند. در همان rebuild_knowledge_base که
+# ایندکس اصلی ساخته می‌شود، کنار آن ساخته می‌شود (نه یک rebuild/trigger جدا).
+faiss_index_v2     = {}   # dict[int, faiss.IndexFlatIP]
+faiss_index_en_v2  = {}   # dict[int, faiss.IndexFlatIP]
+en_index_to_kb_v2  = {}   # dict[int, list]
+embedding_dimension_v2    = {}   # dict[int, int]
+embedding_dimension_en_v2 = {}   # dict[int, int]
+
 # ── self-heal: fingerprint هر event در زمان آخرین rebuild موفق ──
 # dict[int, dict] — {event_id: {"faq": md5hex, "companies": md5hex, "panels": md5hex}}
 # با fingerprint زنده‌ی Postgres مقایسه می‌شود تا drift (مثلاً نوشتن مستقیم روی DB
@@ -219,6 +263,37 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
+# ═══════════════════════════════════════════════
+#  normalize_fa (eval flag، پیش‌فرض خاموش در production) — نرمال‌سازی فارسی
+#  کامل‌تر از normalize_text، یکسان روی query و روی متن KB در زمان index.
+#  هرگز جای normalize_text را نمی‌گیرد — فقط وقتی override={"normalize_fa":true}
+#  صریحاً در /eval/chat یا در PRODUCTION_FLAGS فعال باشد صدا زده می‌شود.
+#  اَبَرمجموعه‌ی normalize_text است (هر تبدیلی که آن انجام می‌دهد، این هم انجام
+#  می‌دهد، به‌علاوه‌ی ارقام و اعراب) — عمداً، تا idempotent باشد: دوباره از آن
+#  عبور دادن یک متن (مثلاً در embed_text_async که همیشه یک normalize_fn را هم
+#  اعمال می‌کند) چیزی را خراب نمی‌کند.
+# ═══════════════════════════════════════════════
+_PERSIAN_ARABIC_DIGITS = str.maketrans(
+    "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"
+)
+# اعراب عربی/فارسی (فتحه، کسره، ضمه، تنوین، شدّه، سکون، مدّه) — معمولاً در متن
+# واقعی کاربر/KB حذف‌اند، اما وقتی باشند similarity را بی‌دلیل کاهش می‌دهند.
+_ARABIC_DIACRITICS_RE = re.compile("[\u064B-\u065F\u0670\u06D6-\u06ED]")
+
+
+def normalize_text_v2(text: str) -> str:
+    text = str(text or "").strip().lower()
+    text = text.translate(_PERSIAN_ARABIC_DIGITS)
+    text = _ARABIC_DIACRITICS_RE.sub("", text)
+    text = text.replace("ي", "ی").replace("ك", "ک")
+    text = text.replace("ۀ", "ه").replace("ة", "ه")
+    text = text.replace("ۂ", "ه").replace("ہ", "ه")  # جایگشت‌های اردو/پاکستانی نادر در ورودی کپی‌شده
+    text = text.replace("‌", " ").replace("‍", "")  # ZWNJ→space (کلمه جدا)، ZWJ→حذف
+    text = re.sub(r"[^\w\sآ-ی]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
 def load_prompt_config():
     try:
         with open(PROMPT_JSON_PATH, encoding="utf-8") as f:
@@ -264,13 +339,15 @@ def get_fallback_message(event_id: int, lang: str) -> str:
     return BOT_SETTINGS.get(event_id, {}).get("fallback_message", {}).get(lang) or DEFAULT_FALLBACK
 
 
-def similarity(a: str, b: str) -> float:
-    return SequenceMatcher(None, normalize_text(a), normalize_text(b)).ratio()
+def similarity(a: str, b: str, normalize_fn=None) -> float:
+    fn = normalize_fn or normalize_text
+    return SequenceMatcher(None, fn(a), fn(b)).ratio()
 
 
-def keyword_score(user_message: str, search_text: str) -> float:
-    user_words = set(normalize_text(user_message).split())
-    faq_words  = set(normalize_text(search_text).split())
+def keyword_score(user_message: str, search_text: str, normalize_fn=None) -> float:
+    fn = normalize_fn or normalize_text
+    user_words = set(fn(user_message).split())
+    faq_words  = set(fn(search_text).split())
     if not user_words or not faq_words:
         return 0.0
     return len(user_words & faq_words) / len(user_words)
@@ -283,15 +360,18 @@ def build_search_text(question: str, answer: str, category: str = "", source_fil
 # ═══════════════════════════════════════════════
 #  I/O async — embed و LLM
 # ═══════════════════════════════════════════════
-async def embed_text_async(text: str) -> list:
+async def embed_text_async(text: str, normalize_fn=None) -> list:
     """
     embedding را به‌صورت async از Ollama می‌گیرد.
     در startup به‌صورت موازی (gather) فراخوانی می‌شود.
     در request هر بار یک‌بار await می‌شود — ترتیب حفظ می‌شود.
+    normalize_fn=None (پیش‌فرض) یعنی دقیقاً رفتار قبلی (normalize_text). فقط
+    eval override normalize_fa=true یا rebuild مسیر v2 مقدار دیگری می‌فرستد.
     """
+    fn = normalize_fn or normalize_text
     resp = await _http.post(
         OLLAMA_EMBED_URL,
-        json={"model": EMBED_MODEL, "prompt": normalize_text(text)},
+        json={"model": EMBED_MODEL, "prompt": fn(text)},
         timeout=60.0,
     )
     resp.raise_for_status()
@@ -1062,6 +1142,136 @@ def _build_faiss_for_items(kb_items: list, cached_embeddings: dict):
     return index, dim, index_en, dim_en, kb_en_indices
 
 
+def _build_faiss_for_items_v2(kb_items: list, cached_embeddings_v2: dict):
+    """
+    دقیقاً معادل _build_faiss_for_items، برای eval flag normalize_fa. آیتم‌ها
+    هیچ فیلد v2-از-قبل-محاسبه‌شده‌ای ندارند (question_norm فقط v1 است) — پس
+    کلید کش اینجا هر بار normalize_text_v2(item["question"]) محاسبه می‌شود.
+    """
+    embedding_list = [
+        cached_embeddings_v2[normalize_text_v2(item["question"])]
+        for item in kb_items
+        if normalize_text_v2(item["question"]) in cached_embeddings_v2
+    ]
+    if embedding_list:
+        emb_np = np.array(embedding_list).astype("float32")
+        dim = emb_np.shape[1]
+        faiss.normalize_L2(emb_np)
+        index = faiss.IndexFlatIP(dim)
+        index.add(emb_np)
+    else:
+        index, dim = None, None
+
+    embedding_list_en = []
+    kb_en_indices = []
+    for i, item in enumerate(kb_items):
+        q_en = item.get("question_en")
+        en_norm_v2 = normalize_text_v2(q_en) if q_en else None
+        if en_norm_v2 and en_norm_v2 in cached_embeddings_v2:
+            embedding_list_en.append(cached_embeddings_v2[en_norm_v2])
+            kb_en_indices.append(i)
+
+    if embedding_list_en:
+        emb_np_en = np.array(embedding_list_en).astype("float32")
+        dim_en = emb_np_en.shape[1]
+        faiss.normalize_L2(emb_np_en)
+        index_en = faiss.IndexFlatIP(dim_en)
+        index_en.add(emb_np_en)
+    else:
+        index_en, dim_en = None, None
+
+    return index, dim, index_en, dim_en, kb_en_indices
+
+
+# ── v2 index build (eval flag normalize_fa) — همیشه در پس‌زمینه، هرگز awaited ──
+# _v2_build_lock جلوی هم‌پوشانی دو build همزمان را می‌گیرد (مثلاً rebuild دستی
+# درست وقتی self-heal دوره‌ای هم trigger شده) — دومی به‌سادگی صرف‌نظر می‌شود،
+# چون یکی که در حال اجراست به همان all_new_items/new_kb_by_event جاری می‌رسد.
+# _v2_background_tasks فقط برای نگه‌داشتن reference (جلوگیری از GC قبل از پایان).
+_v2_build_lock = False
+_v2_background_tasks: set = set()
+
+
+async def _build_v2_index_in_background(new_kb_by_event: dict, all_new_items: list):
+    global _v2_build_lock
+    global faiss_index_v2, faiss_index_en_v2, en_index_to_kb_v2
+    global embedding_dimension_v2, embedding_dimension_en_v2
+    try:
+        cached_embeddings_v2 = {}
+        if EMBEDDINGS_CACHE_PATH_V2.exists():
+            try:
+                with open(EMBEDDINGS_CACHE_PATH_V2, "r", encoding="utf-8") as f:
+                    cached_embeddings_v2 = json.load(f)
+            except Exception:
+                pass
+
+        keys_to_embed_v2 = []
+        for item in all_new_items:
+            v2_key = normalize_text_v2(item["question"])
+            if v2_key not in cached_embeddings_v2:
+                keys_to_embed_v2.append(v2_key)
+            q_en = item.get("question_en")
+            if q_en:
+                en_v2_key = normalize_text_v2(q_en)
+                if en_v2_key not in cached_embeddings_v2:
+                    keys_to_embed_v2.append(en_v2_key)
+        keys_to_embed_v2 = list(dict.fromkeys(keys_to_embed_v2))
+
+        if keys_to_embed_v2:
+            print(f"🔄 [normalize_fa] Embedding {len(keys_to_embed_v2)} new items (background, parallel)...", flush=True)
+            BATCH = 10
+            for batch_start in range(0, len(keys_to_embed_v2), BATCH):
+                batch = keys_to_embed_v2[batch_start: batch_start + BATCH]
+                results = await asyncio.gather(
+                    *[embed_text_async(key, normalize_fn=normalize_text_v2) for key in batch],
+                    return_exceptions=True
+                )
+                for key, result in zip(batch, results):
+                    if isinstance(result, Exception):
+                        print(f"⚠️  [normalize_fa] Embedding error for '{key[:50]}': {result}", flush=True)
+                    else:
+                        cached_embeddings_v2[key] = result
+
+        try:
+            EMBEDDINGS_CACHE_PATH_V2.parent.mkdir(parents=True, exist_ok=True)
+            with open(EMBEDDINGS_CACHE_PATH_V2, "w", encoding="utf-8") as f:
+                json.dump(cached_embeddings_v2, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        new_indices_v2, new_dims_v2 = {}, {}
+        new_indices_en_v2, new_dims_en_v2, new_en_index_to_kb_v2_by_event = {}, {}, {}
+        for ev, items in new_kb_by_event.items():
+            idx, dim, idx_en, dim_en, en_indices = _build_faiss_for_items_v2(items, cached_embeddings_v2)
+            new_indices_v2[ev] = idx
+            new_dims_v2[ev] = dim
+            new_indices_en_v2[ev] = idx_en
+            new_dims_en_v2[ev] = dim_en
+            new_en_index_to_kb_v2_by_event[ev] = en_indices
+
+        faiss_index_v2.update(new_indices_v2)
+        embedding_dimension_v2.update(new_dims_v2)
+        faiss_index_en_v2.update(new_indices_en_v2)
+        embedding_dimension_en_v2.update(new_dims_en_v2)
+        en_index_to_kb_v2.update(new_en_index_to_kb_v2_by_event)
+        print(f"✅ [normalize_fa] v2 index updated for {list(new_kb_by_event.keys())}", flush=True)
+    except Exception as e:
+        print(f"⚠️  [normalize_fa] v2 index build failed, keeping previous v2 state (v1/live /chat unaffected): {e}", flush=True)
+    finally:
+        _v2_build_lock = False
+
+
+def _schedule_v2_background_build(new_kb_by_event: dict, all_new_items: list):
+    global _v2_build_lock
+    if _v2_build_lock:
+        print("ℹ️  [normalize_fa] v2 build already running in background, skipping this trigger", flush=True)
+        return
+    _v2_build_lock = True
+    task = asyncio.create_task(_build_v2_index_in_background(new_kb_by_event, all_new_items))
+    _v2_background_tasks.add(task)
+    task.add_done_callback(_v2_background_tasks.discard)
+
+
 async def rebuild_knowledge_base(event_id: int | None = None) -> bool:
     """
     KNOWLEDGE_BASE[event] را از Postgres (FAQ+companies) + CSVها دوباره می‌سازد،
@@ -1187,6 +1397,17 @@ async def rebuild_knowledge_base(event_id: int | None = None) -> bool:
         faiss_index_en.update(new_indices_en)
         embedding_dimension_en.update(new_dims_en)
         en_index_to_kb.update(new_en_index_to_kb_by_event)
+
+        # ── v2 index (eval flag normalize_fa) — best-effort، کنار v1، در پس‌زمینه ──
+        # عمداً awaited نیست: روی VPS (CPU-only Ollama) embedding هزاران آیتم
+        # می‌تواند به‌جای چند ثانیه به ده‌ها دقیقه بکشد (~۵s/item، سریال چون یک
+        # Ollama تک‌رشته‌ای است) — اگر اینجا await می‌شد، rebuild_knowledge_base
+        # (که در startup هم صدا زده می‌شود) تا پایان آن کل /health و /chat را
+        # بلاک می‌کرد، یعنی v1 زنده هم در عمل قطع می‌شد، فقط به‌خاطر یک eval
+        # flag که اصلاً امروز خاموش است. asyncio.create_task یعنی rebuild اصلی
+        # (v1) فوراً return می‌کند و uvicorn بدون تأخیر سرو می‌کند؛ v2 هر وقت
+        # تمام شد (حتی دقیقه‌ها بعد) خودش globalها را به‌روز می‌کند.
+        _schedule_v2_background_build(new_kb_by_event, all_new_items)
 
         # ── fingerprint تازه برای همین event(ها) — baseline بعدی self-heal ──
         # بعد از دیتابیس، نه قبل — اگر همین‌جا خطا بدهد rebuild را fail نمی‌کند،
@@ -1432,10 +1653,18 @@ class EvalChatRequest(BaseModel):
     بدنه‌ی POST /eval/chat — eval سوالات را مستقل در نظر می‌گیرد (بدون history،
     بدون user_uuid: این یک کاربر واقعی نیست، هیچ XP/badge‌ای در میان نیست و
     اصلاً iph-app این مسیر را صدا نمی‌زند).
+
+    overrides (اختیاری، ۲۰۲۶-۱۰-۰۴): فقط برای همین یک درخواست eval، هرگز روی
+    /chat زنده اثر نمی‌گذارد. کلیدهای معتبر (هر سه اختیاری، نادیده‌گرفته‌شدن
+    کلید ناشناس، نه خطا):
+      normalize_fa (bool)   — index/embedding v2 (نرمال‌سازی فارسی کامل‌تر)
+      judge_abstain (bool)  — prompt judge با few-shot برای "هیچ‌کدام"
+      threshold (float)     — جایگزین MIN_SCORE فقط برای همین request
     """
     message: str
     lang: str = "fa"
     event_id: int
+    overrides: dict | None = None
 
 
 class FAQCreate(BaseModel):
@@ -1744,16 +1973,25 @@ def search_examples(user_message: str):
     return None, best_score
 
 
-def search_exact_knowledge(user_message: str, knowledge_base: list, lang: str = "fa"):
+def search_exact_knowledge(user_message: str, knowledge_base: list, lang: str = "fa", normalize_fn=None):
     """
     knowledge_base اکنون به‌صورت صریح پاس داده می‌شود (لیست آیتم‌های همان event) —
     نه global مستقیم، چون درخواست‌های همزمان ممکن است متعلق به eventهای
     متفاوت باشند و نباید global مشترکی را per-request جابه‌جا کرد (race).
+    normalize_fn=None (پیش‌فرض) یعنی دقیقاً رفتار قبلی: question_norm از قبل
+    محاسبه‌شده (v1) استفاده می‌شود. وقتی داده شود (eval override
+    normalize_fa=true)، چون آیتم فیلد v2 از‌قبل‌محاسبه‌شده ندارد، سوال خام
+    item دوباره با همان تابع نرمال‌سازی می‌شود.
     """
-    user_norm = normalize_text(user_message)
+    fn = normalize_fn or normalize_text
+    user_norm = fn(user_message)
     best, best_score = None, 0.0
     for item in knowledge_base:
-        q_norm = _lang_question_norm(item, lang)
+        if normalize_fn is None:
+            q_norm = _lang_question_norm(item, lang)
+        else:
+            raw_q = _lang_question(item, lang)
+            q_norm = fn(raw_q) if raw_q is not None else None
         if q_norm is None:
             continue  # این آیتم ترجمه انگلیسی ندارد — در جستجوی en نادیده گرفته می‌شود
         if user_norm == q_norm:
@@ -1774,6 +2012,7 @@ async def search_hybrid_knowledge(
     en_indices: list | None,
     top_k: int = 10,
     lang: str = "fa",
+    normalize_fn=None,
 ) -> list:
     """
     FAISS + keyword + fuzzy.
@@ -1784,7 +2023,14 @@ async def search_hybrid_knowledge(
     واقعاً چند رویداد را هم‌زمان از صف چت پردازش می‌کند این نکته حیاتی‌تر است).
     lang="en": از index انگلیسی همان event (فقط آیتم‌های دارای ترجمه) و
     فیلدهای انگلیسی استفاده می‌شود؛ آیتم‌های بدون ترجمه اصلاً وارد نتایج نمی‌شوند.
+    normalize_fn=None (پیش‌فرض) یعنی دقیقاً رفتار قبلی (normalize_text، index
+    v1). caller (resolve_answer) وقتی override/production-flag normalize_fa
+    فعال باشد، هم normalize_text_v2 و هم faiss_index_v2[...]/en_index_to_kb_v2[...]
+    را با هم پاس می‌دهد — این دو همیشه باید زوج باشند (embedding و index از
+    یک فضای برداری)، caller مسئول این هماهنگی است.
     """
+    fn = normalize_fn or normalize_text
+
     def _keyword_only_fallback():
         scored = []
         for item in knowledge_base:
@@ -1793,8 +2039,8 @@ async def search_hybrid_knowledge(
             if search_text is None or question is None:
                 continue
             score = (
-                keyword_score(user_message, search_text) * 0.70
-                + similarity(user_message, question) * 0.30
+                keyword_score(user_message, search_text, normalize_fn=fn) * 0.70
+                + similarity(user_message, question, normalize_fn=fn) * 0.30
             )
             scored.append({"knowledge": item, "score": score})
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -1806,7 +2052,7 @@ async def search_hybrid_knowledge(
     # ── async embed — این تنها I/O این تابع است ──
     # اگر Ollama در دسترس نباشد، به‌جای کرش کل request، به جستجوی keyword-only برمی‌گردیم
     try:
-        embedding = await embed_text_async(user_message)
+        embedding = await embed_text_async(user_message, normalize_fn=fn)
     except Exception as e:
         logger.warning(f"Ollama embedding unavailable (context=search_hybrid), falling back to keyword-only search: {type(e).__name__}: {e}")
         return _keyword_only_fallback()
@@ -1830,8 +2076,8 @@ async def search_hybrid_knowledge(
             continue
         score = (
             float(emb_score) * 0.50
-            + keyword_score(user_message, search_text) * 0.35
-            + similarity(user_message, question) * 0.15
+            + keyword_score(user_message, search_text, normalize_fn=fn) * 0.35
+            + similarity(user_message, question, normalize_fn=fn) * 0.15
         )
         scored.append({"knowledge": item, "score": score})
 
@@ -1915,7 +2161,29 @@ def _candidate_brief(c: dict, lang: str) -> dict:
     }
 
 
-async def select_best_candidate(user_message: str, candidates: list, lang: str = "fa") -> tuple[dict | None, str]:
+_JUDGE_ABSTAIN_SYSTEM_PROMPT = (
+    "You are a strict relevance judge for a pharmaceutical exhibition chatbot. "
+    "Given a user question and a list of FAQ options, output the number of the option "
+    "that DIRECTLY and SPECIFICALLY answers the user's question, or 0 if none of them do. "
+    "You MUST output 0 whenever no option is a direct, specific answer — do not guess or "
+    "pick the closest-sounding option just because something must be chosen.\n\n"
+    "Examples:\n"
+    "User Question: نمایشگاه کجاست؟\n"
+    "Options:\n1. محل برگزاری کجاست؟\n2. هزینه ورود چقدر است؟\n"
+    "Answer: 1\n\n"
+    "User Question: وضعیت آب و هوا امروز چطور است؟\n"
+    "Options:\n1. محل برگزاری کجاست؟\n2. هزینه ورود چقدر است؟\n"
+    "Answer: 0\n\n"
+    "User Question: ساعت کاری نمایشگاه چیه؟\n"
+    "Options:\n1. غرفه شرکت الف کجاست؟\n2. آیا پارکینگ وجود دارد؟\n"
+    "Answer: 0\n\n"
+    "Output ONLY the single digit number, absolutely no other text."
+)
+
+
+async def select_best_candidate(
+    user_message: str, candidates: list, lang: str = "fa", judge_abstain: bool = False
+) -> tuple[dict | None, str]:
     """
     Ollama فقط یک عدد برمی‌گرداند.
     async — در حین انتظار Ollama، event loop برای بقیه requestها آزاد است.
@@ -1928,6 +2196,11 @@ async def select_best_candidate(user_message: str, candidates: list, lang: str =
     این تفکیک برای /eval/chat لازم است: یک fallback به‌خاطر خرابی judge نباید
     مثل یک abstain واقعی (no_match) حساب شود — iph-apn این دو را به outcome
     متفاوت نگاشت می‌کند (error در برابر correct_abstain).
+
+    judge_abstain=False (پیش‌فرض، production امروز): همان prompt قبلی، بدون
+    تغییر. judge_abstain=True (eval flag): prompt جایگزین با چند few-shot
+    example که گزینه‌ی "هیچ‌کدام" (۰) را واضح‌تر نشان می‌دهد — فرضیه این است
+    که judge با نمونه، کمتر مجبور به انتخاب یک گزینه‌ی نادرست حس می‌کند.
     """
     if not candidates:
         return None, "no_match"
@@ -1942,14 +2215,17 @@ async def select_best_candidate(user_message: str, candidates: list, lang: str =
         for i, c in enumerate(candidates, 1)
     )
 
-    system_prompt = (
-        "You are a strict relevance judge for a pharmaceutical exhibition chatbot. "
-        "Given a user question and a list of FAQ options, output the number of the option "
-        "that DIRECTLY and SPECIFICALLY answers the user's question. "
-        "CRITICAL: If the user is asking about a general topic or about a specific "
-        "company/person NOT mentioned in the options, output 0. "
-        "Output ONLY the single digit number, absolutely no other text."
-    )
+    if judge_abstain:
+        system_prompt = _JUDGE_ABSTAIN_SYSTEM_PROMPT
+    else:
+        system_prompt = (
+            "You are a strict relevance judge for a pharmaceutical exhibition chatbot. "
+            "Given a user question and a list of FAQ options, output the number of the option "
+            "that DIRECTLY and SPECIFICALLY answers the user's question. "
+            "CRITICAL: If the user is asking about a general topic or about a specific "
+            "company/person NOT mentioned in the options, output 0. "
+            "Output ONLY the single digit number, absolutely no other text."
+        )
     user_prompt = f"User Question: {user_message}\n\nOptions:\n{options}\n\nAnswer (0 if none match):"
 
     raw = await call_ollama_async(
@@ -1992,10 +2268,29 @@ async def select_best_candidate(user_message: str, candidates: list, lang: str =
 #  matched_question, score, item_type, item_id, abstained, judge_status،
 #  candidates (فقط برای مسیرهایی که واقعاً hybrid search اجرا شده).
 # ═══════════════════════════════════════════════
-async def resolve_answer(user_message: str, event_id: int, lang: str, history: list | None = None) -> dict:
+async def resolve_answer(
+    user_message: str, event_id: int, lang: str, history: list | None = None, overrides: dict | None = None
+) -> dict:
+    """
+    overrides=None (یا {}) یعنی دقیقاً رفتار قبلی، بدون هیچ تفاوت — این دقیقاً
+    چیزی است که run_chat_pipeline (مسیر عمومی /chat) با PRODUCTION_FLAGS صدا
+    می‌زند، و چون همه‌ی آن پرچم‌ها امروز خاموش‌اند، معادل overrides=None است.
+    کلیدهای پشتیبانی‌شده (هر سه اختیاری): normalize_fa (bool)، judge_abstain
+    (bool)، threshold (float). فقط /eval/chat اجازه دارد اینها را per-request
+    صریح بفرستد؛ /chat فقط PRODUCTION_FLAGS را می‌فرستد.
+    """
     history = history or []
+    overrides = overrides or {}
+    use_v2 = bool(overrides.get("normalize_fa"))
+    judge_abstain = bool(overrides.get("judge_abstain"))
+    min_score = overrides.get("threshold")
+    if min_score is None:
+        min_score = MIN_SCORE
+    norm_fn = normalize_text_v2 if use_v2 else None  # None یعنی "پیش‌فرض‌های هر تابع را استفاده کن" (v1)
 
     # ۱. Query Enricher (sync CPU — روی thread جدا تا event loop تک‌پردازه را در بار همزمان بلاک نکند)
+    # عمداً همیشه v1: این فقط heuristic تزریق entity از تاریخچه است، نه بخشی
+    # از retrieval که normalize_fa قرار است رویش اندازه‌گیری شود.
     search_query = await asyncio.to_thread(contextualize_question, user_message, history)
 
     # ۲. Example search (sync CPU — روی thread جدا، مستقل از event، از prompt_config می‌آید)
@@ -2019,7 +2314,9 @@ async def resolve_answer(user_message: str, event_id: int, lang: str, history: l
         }
 
     # ۳. Exact / fuzzy search (sync CPU — روی thread جدا؛ O(n) روی KNOWLEDGE_BASE همین event)
-    exact_item, exact_score = await asyncio.to_thread(search_exact_knowledge, search_query, knowledge_base, lang=lang)
+    exact_item, exact_score = await asyncio.to_thread(
+        search_exact_knowledge, search_query, knowledge_base, lang=lang, normalize_fn=norm_fn
+    )
     if exact_item:
         ans = _lang_answer(exact_item, lang)
         if exact_item.get("is_directory"):
@@ -2031,10 +2328,15 @@ async def resolve_answer(user_message: str, event_id: int, lang: str, history: l
         }
 
     # ۴. FAISS + hybrid (async — شامل embed I/O) — index/en_indices صریحاً همین event
-    index = faiss_index_en.get(event_id) if lang == "en" else faiss_index.get(event_id)
-    en_indices = en_index_to_kb.get(event_id) if lang == "en" else None
+    # normalize_fa فعال: index v2 (کنار v1، نه جای آن) + embedding/keyword/fuzzy v2
+    if use_v2:
+        index = faiss_index_en_v2.get(event_id) if lang == "en" else faiss_index_v2.get(event_id)
+        en_indices = en_index_to_kb_v2.get(event_id) if lang == "en" else None
+    else:
+        index = faiss_index_en.get(event_id) if lang == "en" else faiss_index.get(event_id)
+        en_indices = en_index_to_kb.get(event_id) if lang == "en" else None
     all_candidates = await search_hybrid_knowledge(
-        search_query, knowledge_base, index, en_indices, top_k=10, lang=lang
+        search_query, knowledge_base, index, en_indices, top_k=10, lang=lang, normalize_fn=norm_fn
     )
     # خلاصه‌ی top-5 برای eval — همیشه از نتایج خام قبل از فیلتر آستانه، تا
     # بازبین eval ببیند اگر MIN_SCORE کمی پایین‌تر بود چه کاندیدی رد می‌شد.
@@ -2049,8 +2351,8 @@ async def resolve_answer(user_message: str, event_id: int, lang: str, history: l
 
     print(f"📊 scores: {[round(c['score'],3) for c in all_candidates]}", flush=True)
 
-    # ۵. Threshold filter
-    candidates = [c for c in all_candidates if c["score"] >= MIN_SCORE]
+    # ۵. Threshold filter — override اگر داده شده باشد، وگرنه MIN_SCORE استاندارد
+    candidates = [c for c in all_candidates if c["score"] >= min_score]
     if not candidates:
         fallback = get_fallback_message(event_id, lang)
         return {
@@ -2060,7 +2362,9 @@ async def resolve_answer(user_message: str, event_id: int, lang: str, history: l
         }
 
     # ۶. Ollama انتخاب (async — I/O)
-    selected, judge_status = await select_best_candidate(search_query, candidates[:5], lang=lang)
+    selected, judge_status = await select_best_candidate(
+        search_query, candidates[:5], lang=lang, judge_abstain=judge_abstain
+    )
     if not selected:
         fallback = get_fallback_message(event_id, lang)
         return {
@@ -2113,7 +2417,10 @@ async def run_chat_pipeline(req: ChatRequest) -> dict:
         await log_chat_interaction(user_message, ans, "meta", 1.0, event_id=event_id, user_uuid=user_uuid, lang=lang)
         return {"answer": ans, "source": "meta"}
 
-    result = await resolve_answer(user_message, event_id, lang, req.history)
+    # PRODUCTION_FLAGS همیشه همینجاست (نه یک کپی) — اگر یک روز یکی از آنها در
+    # production روشن شود، فقط همین env var تغییر می‌کند، نه این خط. امروز
+    # هر سه خاموش‌اند، یعنی این دقیقاً معادل overrides=None است.
+    result = await resolve_answer(user_message, event_id, lang, req.history, overrides=PRODUCTION_FLAGS)
 
     await log_chat_interaction(
         user_message, result["answer"], result["source"], result["score"],
@@ -2769,6 +3076,15 @@ async def admin_kb_fingerprint(event_id: int = Query(...), _: None = Depends(ver
 #  هر دو endpoint با همان X-Admin-Key محافظت می‌شوند.
 # ═══════════════════════════════════════════════
 EVAL_SLOT_WAIT_SECONDS = 10.0  # eval sequential است، این فقط یک سقف احتیاطی برای رقابت گذرا با ترافیک واقعی
+_VALID_OVERRIDE_KEYS = {"normalize_fa", "judge_abstain", "threshold"}
+
+
+def _sanitize_overrides(raw: dict | None) -> dict:
+    """کلیدهای ناشناس بی‌صدا نادیده گرفته می‌شوند، نه خطا — یک typo در بدنه‌ی
+    eval نباید کل request را بترکاند، فقط آن override را بی‌اثر می‌کند."""
+    if not raw:
+        return {}
+    return {k: v for k, v in raw.items() if k in _VALID_OVERRIDE_KEYS}
 
 
 @app.post("/eval/chat")
@@ -2779,12 +3095,17 @@ async def eval_chat(req: EvalChatRequest, _: None = Depends(verify_admin_key)):
     item_type/item_id (منبعی که واقعاً پاسخ داد)، top-5 candidates با امتیاز،
     judge_status (picked/no_match/judge_unavailable_fallback_used)، abstained،
     و latency_ms.
+    overrides (۲۰۲۶-۱۰-۰۴): اگر در بدنه فرستاده شود، فقط همین یک request را
+    تحت تأثیر قرار می‌دهد — resolve_answer با overrides=None/{} دقیقاً همان
+    مسیر v1 را می‌رود، پس /chat (که overrides=PRODUCTION_FLAGS می‌فرستد، امروز
+    همه خاموش) هیچ‌وقت از این مسیر اثر نمی‌گیرد.
     از همان _slot_semaphore ظرفیت استفاده می‌کند (با timeout، نه صف) — تا یک
     اجرای eval نتواند بدون محدودیت روی ترافیک واقعی سوار شود؛ اگر ظرف
     EVAL_SLOT_WAIT_SECONDS یک slot آزاد نشد، source="capacity_limited"
     برمی‌گرداند (iph-apn این را outcome="error" حساب می‌کند، نه fail واقعی).
     """
     lang = "en" if req.lang == "en" else "fa"
+    overrides = _sanitize_overrides(req.overrides)
     t0 = time.monotonic()
     try:
         await asyncio.wait_for(_slot_semaphore.acquire(), timeout=EVAL_SLOT_WAIT_SECONDS)
@@ -2795,7 +3116,7 @@ async def eval_chat(req: EvalChatRequest, _: None = Depends(verify_admin_key)):
             "latency_ms": round((time.monotonic() - t0) * 1000), "candidates": [],
         }
     try:
-        result = await resolve_answer(req.message.strip(), req.event_id, lang, history=None)
+        result = await resolve_answer(req.message.strip(), req.event_id, lang, history=None, overrides=overrides)
     finally:
         _slot_semaphore.release()
 
@@ -2808,6 +3129,7 @@ async def eval_chat(req: EvalChatRequest, _: None = Depends(verify_admin_key)):
         "judge_status": result.get("judge_status"),
         "latency_ms": round((time.monotonic() - t0) * 1000),
         "candidates": result.get("candidates", []),
+        "overrides_applied": overrides,
     }
 
 
@@ -2824,4 +3146,8 @@ async def eval_config(event_id: int = Query(...), _: None = Depends(verify_admin
         "min_score_threshold": MIN_SCORE,
         "git_commit": GIT_COMMIT,
         "kb_fingerprint": compute_kb_fingerprint(event_id),
+        # چه کدام بهبود accuracy (۲۰۲۶-۱۰-۰۴) امروز روی ترافیک واقعی /chat
+        # فعال است — همه باید false/null باشند تا eval set واقعی برچسب‌گذاری
+        # و در برابر baseline سنجیده شود.
+        "production_flags": PRODUCTION_FLAGS,
     }
